@@ -334,6 +334,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and not addend.requires_grad
             and not layer.weight.requires_grad
         ):
+            # Reuse addend as beta input and output; cuBLAS rounds once after GEMM.
             return torch.addmm(addend, x, layer.weight.t(), out=addend)
 
         output = self.apply(layer, x, bias)
