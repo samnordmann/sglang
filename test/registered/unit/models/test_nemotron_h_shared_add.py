@@ -80,6 +80,22 @@ def test_latent_projection_preserves_fallback_for_noncontiguous_addend(monkeypat
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
+def test_latent_projection_preserves_compiled_fallback(monkeypatch):
+    monkeypatch.setattr(unquant, "_BF16_GEMM_BACKEND", Bf16GemmBackend.TORCH)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    projection, method = _make_projection(64, 128)
+    routed = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
+    shared = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+
+    candidate = method.apply_with_addend(projection, routed, shared)
+    reference = F.linear(routed, projection.weight) + shared
+
+    torch.testing.assert_close(candidate, reference, rtol=0, atol=0)
+    assert candidate.data_ptr() != shared.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
 def test_latent_projection_preserves_cutedsl_selected_path(monkeypatch):
     monkeypatch.setattr(unquant, "_BF16_GEMM_BACKEND", Bf16GemmBackend.CUTEDSL)
     monkeypatch.setattr(unquant, "_use_cutedsl_bf16_gemm", lambda *args: True)

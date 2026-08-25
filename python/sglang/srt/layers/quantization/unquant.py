@@ -320,7 +320,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
         )
         if (
-            uses_torch_gemm
+            not torch.compiler.is_compiling()
+            and uses_torch_gemm
             and x.is_cuda
             and x.ndim == 2
             and x.dtype == torch.bfloat16
