@@ -297,6 +297,48 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         return F.linear(x, layer.weight, bias)
 
+    def apply_with_addend(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        addend: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply a linear layer and accumulate it into ``addend`` when possible."""
+        backend = get_bf16_gemm_backend()
+        uses_torch_gemm = backend in (
+            Bf16GemmBackend.AUTO,
+            Bf16GemmBackend.TORCH,
+        ) or (
+            backend.is_cutedsl()
+            and not torch.compiler.is_compiling()
+            and _use_cutedsl_bf16_gemm is not None
+            and not _use_cutedsl_bf16_gemm(
+                x.numel() // x.shape[-1],
+                layer.weight.shape[0],
+                layer.weight.shape[1],
+            )
+        )
+        if (
+            uses_torch_gemm
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and addend.dtype == torch.bfloat16
+            and addend.is_contiguous()
+            and addend.shape == (x.shape[0], layer.weight.shape[0])
+            and bias is None
+            and not x.requires_grad
+            and not addend.requires_grad
+            and not layer.weight.requires_grad
+        ):
+            return torch.addmm(addend, x, layer.weight.t(), out=addend)
+
+        output = self.apply(layer, x, bias)
+        output.add_(addend)
+        return output
+
     def apply_into(
         self,
         layer: torch.nn.Module,
