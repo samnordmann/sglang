@@ -1068,10 +1068,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
 
-    # Internal 128-bit room-lease identity, minted once before scheduler fanout.
-    # Keep this append-only: TokenizedGenerateReqInput is an array-like wire type.
-    transfer_generation: Optional[str] = None
-
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 

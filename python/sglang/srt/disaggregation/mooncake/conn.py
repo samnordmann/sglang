@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import FrozenSet, List, Optional, Set, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -22,12 +22,9 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
-    validate_transfer_generation,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
-    STAGING_REQ_WIRE_TAG,
-    STAGING_RSP_WIRE_TAG,
     DecodeStagingContext,
     PrefillStagingContext,
     StagingManagerMixin,
@@ -78,31 +75,6 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
-MOONCAKE_CHUNK_READY_WIRE_TAG = b"CHUNK_READY_V2"
-MOONCAKE_AUX_DATA_WIRE_TAG = b"AUX_DATA_V2"
-MOONCAKE_TRANSFER_STATUS_WIRE_TAG = b"TRANSFER_STATUS_V2"
-_MAX_MOONCAKE_CONTROL_UINT_DIGITS = 20
-
-
-def _parse_mooncake_control_uint(
-    frame: bytes, field: str, *, positive: bool = False
-) -> int:
-    if type(frame) is not bytes:
-        raise ValueError(f"{field} must be exact bytes")
-    value = frame.decode("ascii")
-    if (
-        not value
-        or len(value) > _MAX_MOONCAKE_CONTROL_UINT_DIGITS
-        or not value.isdecimal()
-        or (len(value) > 1 and value[0] == "0")
-    ):
-        raise ValueError(f"{field} must be canonical bounded unsigned decimal")
-    parsed = int(value)
-    if positive and parsed == 0:
-        raise ValueError(f"{field} must be positive")
-    return parsed
-
-
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
@@ -123,7 +95,6 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
-    transfer_generation: str = ""
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -156,9 +127,6 @@ class TransferInfo:
                 np.frombuffer(msg[9], dtype=np.int32)
                 if len(msg) > 9 and msg[9] != b""
                 else None
-            ),
-            transfer_generation=validate_transfer_generation(
-                msg[10].decode("ascii") if len(msg) > 10 else None
             ),
         )
 
@@ -237,15 +205,8 @@ class KVArgsRegisterInfo:
         )
 
 
-@dataclasses.dataclass(frozen=True)
-class _MooncakeReceiveLease:
-    generation: str
-    session_id: str
-    expected_prefill_ranks: Optional[FrozenSet[int]] = None
-
-
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
-    AUX_DATA_HEADER = MOONCAKE_AUX_DATA_WIRE_TAG
+    AUX_DATA_HEADER = b"AUX_DATA"
 
     def __init__(
         self,
@@ -325,7 +286,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     daemon=True,
                 ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self._receive_transfer_leases: dict[int, _MooncakeReceiveLease] = {}
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
@@ -382,77 +342,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
-
-    def _register_receive_transfer_lease(
-        self,
-        room: int,
-        generation: str,
-        session_id: str,
-        expected_prefill_ranks: Optional[FrozenSet[int]] = None,
-    ) -> None:
-        """Bind immutable decode control identity before accepting wire events."""
-
-        room = int(room)
-        generation = validate_transfer_generation(generation)
-        if type(session_id) is not str or not session_id:
-            raise ValueError("Mooncake receive lease requires a non-empty session")
-        expected = None
-        if expected_prefill_ranks is not None:
-            expected = frozenset(expected_prefill_ranks)
-            if not expected or any(
-                type(rank) is not int or rank < 0 for rank in expected
-            ):
-                raise ValueError(
-                    "Mooncake receive lease ranks must be non-empty non-negative ints"
-                )
-        candidate = _MooncakeReceiveLease(generation, session_id, expected)
-        with self._abort_state_lock:
-            current = self._receive_transfer_leases.get(room)
-            if current is None:
-                self._receive_transfer_leases[room] = candidate
-                self.prefill_response_tracker[room] = set()
-                return
-            if current.generation != generation or current.session_id != session_id:
-                raise RuntimeError(
-                    "Mooncake room already has a different receive lease"
-                )
-            if current.expected_prefill_ranks is not None and current != candidate:
-                raise RuntimeError("Mooncake receive lease rank identity is immutable")
-            self._receive_transfer_leases[room] = candidate
-
-    @staticmethod
-    def _receive_control_matches_unlocked(
-        lease: Optional[_MooncakeReceiveLease],
-        generation: str,
-        prefill_rank: int,
-        *,
-        session_id: Optional[str] = None,
-    ) -> bool:
-        return bool(
-            lease is not None
-            and lease.expected_prefill_ranks is not None
-            and lease.generation == generation
-            and prefill_rank in lease.expected_prefill_ranks
-            and (session_id is None or lease.session_id == session_id)
-        )
-
-    def _clear_receive_transfer_lease(self, room: int, generation: str) -> bool:
-        """Clear only this receiver's identity and room state, atomically."""
-
-        room = int(room)
-        generation = validate_transfer_generation(generation)
-        with self._abort_state_lock:
-            current = self._receive_transfer_leases.get(room)
-            # Absence is not proof of ownership. A duplicate delayed clear for
-            # lease A can otherwise erase room state that lease B published
-            # immediately before B atomically binds its receive identity.
-            if current is None or current.generation != generation:
-                return False
-            self._receive_transfer_leases.pop(room, None)
-            self.request_status.pop(room, None)
-            self.required_prefill_response_num_table.pop(room, None)
-            self.prefill_response_tracker.pop(room, None)
-            return True
 
     def set_kv_buffer_tensors(
         self,
@@ -513,8 +402,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._send_multipart_locked(
             na.to_tcp(),
             [
-                MOONCAKE_CHUNK_READY_WIRE_TAG,
-                req.transfer_generation.encode("ascii"),
+                b"CHUNK_READY",
                 str(req.room).encode("ascii"),
                 str(chunk_idx).encode("ascii"),
                 str(kv_chunk.index_slice.start).encode("ascii"),
@@ -959,9 +847,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def _await_transfer_futures(self, futures) -> int:
         """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future, so every running future is
-        drained before returning. No write may outlive the call that publishes
-        the drain proof, regardless of the legacy compatibility field."""
+        cancel() is a no-op for a running future, so with deferred release on we
+        still drain the running ones before returning (no write may outlive this
+        call, which the drain-ack relies on). Off: original early-return."""
         ret = 0
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -972,6 +860,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ret = status
                 for f in futures:
                     f.cancel()
+                if not self.enable_deferred_decode_kv_release:
+                    return ret
         return ret
 
     def send_kvcache(
@@ -1270,13 +1160,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         req: TransferInfo,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
-        prefill_rank: int,
     ):
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
         if (
             self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK"
         ) or envs.SGLANG_MOONCAKE_SEND_AUX_TCP.get():
-            return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs, prefill_rank)
+            return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs)
 
         transfer_blocks = []
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
@@ -1295,7 +1184,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         req: TransferInfo,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
-        prefill_rank: int,
     ):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
@@ -1309,8 +1197,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 remote=req.endpoint,
                 dst_port=req.dst_port,
                 room=req.room,
-                transfer_generation=req.transfer_generation,
-                prefill_rank=prefill_rank,
                 buffer_index=i,
                 aux_index=req.dst_aux_index,
                 data=data,
@@ -1323,8 +1209,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         remote: str,
         dst_port: int,
         room: int,
-        transfer_generation: str,
-        prefill_rank: int,
         buffer_index: int,
         aux_index: int,
         data: bytes,
@@ -1334,9 +1218,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             na.to_tcp(),
             [
                 MooncakeKVManager.AUX_DATA_HEADER,
-                validate_transfer_generation(transfer_generation).encode("ascii"),
                 str(room).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
                 str(buffer_index).encode("ascii"),
                 str(aux_index).encode("ascii"),
                 struct.pack(">I", len(data)),
@@ -1345,62 +1227,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
-    def _handle_aux_data(self, msg: List[bytes]) -> bool:
-        """Handle one exact-lease AUX_DATA message without room-reuse ABA."""
-        try:
-            if len(msg) != 8 or msg[0] != MOONCAKE_AUX_DATA_WIRE_TAG:
-                raise ValueError("unsupported AUX_DATA wire layout")
-            generation = validate_transfer_generation(msg[1].decode("ascii"))
-            room = _parse_mooncake_control_uint(msg[2], "room")
-            prefill_rank = _parse_mooncake_control_uint(msg[3], "prefill rank")
-            buffer_index = _parse_mooncake_control_uint(msg[4], "buffer index")
-            aux_index = _parse_mooncake_control_uint(msg[5], "aux index")
-            if type(msg[6]) is not bytes or len(msg[6]) != 4:
-                raise ValueError("AUX_DATA length must be one uint32 frame")
-            data_length = struct.unpack(">I", msg[6])[0]
-            data = msg[7]
-            if type(data) is not bytes or len(data) != data_length:
-                raise ValueError("AUX_DATA payload length mismatch")
-        except (
-            AttributeError,
-            IndexError,
-            TypeError,
-            UnicodeError,
-            ValueError,
-        ) as error:
-            logger.warning("Dropping malformed or legacy AUX_DATA: %s", error)
-            return False
+    def _handle_aux_data(self, msg: List[bytes]):
+        """Handle AUX_DATA messages received by the decode thread."""
+        room = int(msg[1].decode("ascii"))
+        buffer_index = int(msg[2].decode("ascii"))
+        aux_index = int(msg[3].decode("ascii"))
+        data_length = struct.unpack(">I", msg[4])[0]
+        data = msg[5]
 
-        # Identity validation and the destination write are one critical
-        # section with receiver clear/rebind. An old lease can therefore never
-        # pass validation and then write through a newly reused room.
-        with self._abort_state_lock:
-            lease = self._receive_transfer_leases.get(room)
-            if not self._receive_control_matches_unlocked(
-                lease, generation, prefill_rank
-            ):
-                logger.warning(
-                    "Dropping stale or unexpected-rank AUX_DATA room=%s "
-                    "generation=%s rank=%s",
-                    room,
-                    generation,
-                    prefill_rank,
-                )
-                return False
-            try:
-                AuxDataCodec.deserialize_data_to_buffer(
-                    self.kv_args, buffer_index, aux_index, data
-                )
-            except Exception as error:
-                logger.error("Failed to apply authenticated AUX_DATA: %s", error)
-                return False
+        if len(data) != data_length:
+            logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
+            return
+
+        AuxDataCodec.deserialize_data_to_buffer(
+            self.kv_args, buffer_index, aux_index, data
+        )
 
         logger.debug(
-            "Received generation-bound AUX_DATA for bootstrap_room %s with length:%s",
-            room,
-            len(data),
+            f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
-        return True
 
     def _get_dsa_cache_transfer_skip_flags(
         self, info: Optional[KVArgsRegisterInfo]
@@ -1839,20 +1684,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def sync_status_to_decode_endpoint(
-        self,
-        remote: str,
-        dst_port: int,
-        room: int,
-        status: int,
-        prefill_rank: int,
-        transfer_generation: str,
+        self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         na = NetworkAddress(remote, dst_port)
         self._send_multipart_locked(
             na.to_tcp(),
             [
-                MOONCAKE_TRANSFER_STATUS_WIRE_TAG,
-                validate_transfer_generation(transfer_generation).encode("ascii"),
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
@@ -1890,7 +1727,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # the predicate the abort ack relies on. The flag survives
                 # re-enqueue on defer.
                 if not kv_chunk.staging_counted:
-                    self._count_transfer_writer(kv_chunk.room)
+                    self._staging_outstanding[kv_chunk.room] += 1
                     kv_chunk.staging_counted = True
 
                 if (
@@ -1906,13 +1743,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
-                    remaining_writers = self._uncount_transfer_writer(kv_chunk.room)
-                    kv_chunk.staging_counted = False
-                    if remaining_writers == 0 and self.mark_transfer_quiescent(
-                        kv_chunk.room
-                    ):
-                        self.transfer_infos.pop(kv_chunk.room, None)
-                        self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                    self._staging_outstanding.pop(kv_chunk.room, None)
+                    if self.enable_deferred_decode_kv_release:
+                        # Skipped => nothing written for this aborted room; ack.
+                        self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
 
                 if (
@@ -1954,7 +1788,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     req.room,
                                     KVPoll.Failed,
                                     prefill_unique_rank,
-                                    req.transfer_generation,
                                 )
                                 break
 
@@ -2109,7 +1942,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 req.room,
                                 KVPoll.Failed,
                                 prefill_unique_rank,
-                                req.transfer_generation,
                             )
                             break
 
@@ -2141,7 +1973,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         req.room,
                                         KVPoll.Failed,
                                         prefill_unique_rank,
-                                        req.transfer_generation,
                                     )
                                     break
 
@@ -2150,35 +1981,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
-                                prefill_unique_rank,
                             )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
-                                (
-                                    req.endpoint,
-                                    req.dst_port,
-                                    req.room,
-                                    req.transfer_generation,
-                                )
+                                (req.endpoint, req.dst_port, req.room)
                             )
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
-                                for (
-                                    endpoint,
-                                    dst_port,
-                                    room,
-                                    generation,
-                                ) in dst_ranks_infos:
+                                for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
                                         dst_port,
                                         room,
                                         status,
                                         prefill_unique_rank,
-                                        generation,
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
@@ -2203,22 +2022,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if staging_deferred:
                     continue
 
-                remaining_writers = self._uncount_transfer_writer(kv_chunk.room)
-                kv_chunk.staging_counted = False
+                self._staging_outstanding[kv_chunk.room] -= 1
+                if self.enable_deferred_decode_kv_release:
+                    # In-flight write finished; if aborted and nothing outstanding,
+                    # the pages are idle -> release the held ack.
+                    self._maybe_ack_drained_abort(kv_chunk.room)
                 # Tear down only when no chunk is still outstanding and the room
                 # has concluded: already cleared, Success, or a Failed *last*
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
                 # follow), not on the last chunk alone since an earlier deferred
                 # chunk may still need to transfer.
-                if (
-                    remaining_writers == 0
-                    and (
-                        kv_chunk.room not in self.request_status
-                        or self.check_status(kv_chunk.room) == KVPoll.Success
-                        or self.check_status(kv_chunk.room) == KVPoll.Failed
+                if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
+                    kv_chunk.room not in self.request_status
+                    or self.check_status(kv_chunk.room) == KVPoll.Success
+                    or (
+                        kv_chunk.is_last_chunk
+                        and self.check_status(kv_chunk.room) == KVPoll.Failed
                     )
-                    and self.mark_transfer_quiescent(kv_chunk.room)
                 ):
+                    self._staging_outstanding.pop(kv_chunk.room, None)
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
@@ -2248,52 +2070,76 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
                     continue
                 # Staging: decode replies with allocated staging offset
-                if waiting_req_bytes[0] == STAGING_RSP_WIRE_TAG:
+                if room == "STAGING_RSP":
                     handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
                 # Decode-side abort notification: mark room as failed and ACK
                 if room == "ABORT":
-                    try:
-                        if len(waiting_req_bytes) != 5:
-                            raise ValueError("ABORT must contain exactly five frames")
-                        room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
-                        decode_ip = waiting_req_bytes[2].decode("ascii")
-                        decode_port = int(waiting_req_bytes[3].decode("ascii"))
-                        transfer_generation = validate_transfer_generation(
-                            waiting_req_bytes[4].decode("ascii")
-                        )
-                    except Exception as error:
-                        logger.warning("Ignoring malformed ABORT: %s", error)
-                        continue
-                    generation_active = (
-                        self.active_transfer_generation(room_to_be_aborted)
-                        == transfer_generation
-                    )
+                    room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
+                    decode_ip = waiting_req_bytes[2].decode("ascii")
+                    decode_port = int(waiting_req_bytes[3].decode("ascii"))
                     room_active = (
-                        generation_active
-                        and room_to_be_aborted in self.request_status
+                        room_to_be_aborted in self.request_status
                         and self.check_status(room_to_be_aborted) != KVPoll.Success
                     )
+                    if self.enable_deferred_decode_kv_release:
+                        # Mark Failed FIRST (stops add_transfer_request enqueuing
+                        # new chunks), THEN register the ack target: registering
+                        # first would let the worker drain+ack while the room is
+                        # not yet Failed, so a newly enqueued chunk could still
+                        # write to the freed pages. The worker (not this thread)
+                        # acks once its in-flight write drains; if nothing is in
+                        # flight, decode falls back to the release timeout.
+                        if room_active:
+                            self.update_status(room_to_be_aborted, KVPoll.Failed)
+                            self.register_deferred_ack_target(
+                                room_to_be_aborted, decode_ip, decode_port
+                            )
+                            # Try once: the room may already be quiescent and
+                            # never revisited by the worker.
+                            self._maybe_ack_drained_abort(room_to_be_aborted)
+                            logger.debug(
+                                f"Received abort notification for room {room_to_be_aborted}, "
+                                f"marked as Failed; ACK deferred until transfer drains"
+                            )
+                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
+                            # Concluded/unknown AND quiescent: ack now. A cleared
+                            # room is not automatically quiescent -- clear() can
+                            # drop a room whose chunk is still transferring.
+                            self._send_abort_ack(
+                                decode_ip, decode_port, room_to_be_aborted
+                            )
+                        continue
+                    # No need to abort the room if it has already succeeded
                     if room_active:
                         self.update_status(room_to_be_aborted, KVPoll.Failed)
                         logger.debug(
                             f"Received abort notification for room {room_to_be_aborted}, "
                             f"marked as Failed"
                         )
-                    if self.register_deferred_ack_target(
-                        room_to_be_aborted,
-                        transfer_generation,
-                        decode_ip,
-                        decode_port,
-                    ):
-                        self._maybe_ack_drained_abort(
-                            room_to_be_aborted, transfer_generation
-                        )
-                    elif not generation_active:
+                    else:
                         logger.debug(
-                            "Ignoring stale ABORT for room %s generation %s",
-                            room_to_be_aborted,
-                            transfer_generation,
+                            f"Received abort notification for room {room_to_be_aborted}, "
+                            f"ignoring (already completed or unknown)"
+                        )
+                    # Send ACK back to decode endpoint
+                    try:
+                        na = NetworkAddress(decode_ip, decode_port)
+                        self._send_multipart_locked(
+                            na.to_tcp(),
+                            [
+                                b"ABORT_ACK",
+                                str(room_to_be_aborted).encode("ascii"),
+                            ],
+                            is_ipv6=na.is_ipv6,
+                        )
+                        logger.debug(
+                            f"Sent ABORT_ACK for room {room_to_be_aborted} to "
+                            f"{decode_ip}:{decode_port}"
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
                         )
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
@@ -2322,37 +2168,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     continue
                 else:
-                    try:
-                        required_dst_info_num = int(
-                            waiting_req_bytes[7].decode("ascii")
-                        )
-                        room = int(room)
-                        transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
-                    except (IndexError, UnicodeError, ValueError) as error:
-                        # A recyclable room number is not an identity. Missing
-                        # or malformed generation metadata cannot fail whichever
-                        # newer lease happens to own that number, and must not
-                        # terminate the long-lived listener thread.
-                        logger.warning(
-                            "Dropping unauthenticated Mooncake room metadata: %s",
-                            error,
-                        )
-                        continue
-                    if not self.register_transfer_generation(
-                        room, transfer_info.transfer_generation
-                    ):
-                        logger.warning(
-                            "Dropping late Mooncake metadata for room %s "
-                            "generation %s; active generation is %s",
-                            room,
-                            transfer_info.transfer_generation,
-                            self.active_transfer_generation(room),
-                        )
-                        continue
+                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
+                    room = int(room)
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = transfer_info
+                    self.transfer_infos[room][mooncake_session_id] = (
+                        TransferInfo.from_zmq(waiting_req_bytes)
+                    )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
@@ -2377,151 +2200,71 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
 
                 # Staging: prefill notifies a chunk written to staging buffer
-                if msg[0] == MOONCAKE_CHUNK_READY_WIRE_TAG:
-                    self._handle_chunk_ready(msg)
+                if msg[0] == b"CHUNK_READY":
+                    room = int(msg[1].decode("ascii"))
+                    chunk_idx = int(msg[2].decode("ascii"))
+                    page_start = int(msg[3].decode("ascii"))
+                    num_pages = int(msg[4].decode("ascii"))
+                    session_id = msg[5].decode("ascii")
+                    handler = self._staging_handler
+                    assert handler is not None, (
+                        "CHUNK_READY received before staging handler initialized"
+                    )
+                    handler.handle_chunk_arrived(
+                        room,
+                        chunk_idx,
+                        page_start,
+                        num_pages,
+                        session_id,
+                    )
                     continue
 
                 # Staging: prefill pre-requests staging allocation before forward
-                if msg[0] == STAGING_REQ_WIRE_TAG:
+                if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
                     continue
 
                 # Prefill acknowledges abort notification
                 if msg[0] == b"ABORT_ACK":
-                    try:
-                        if len(msg) != 4:
-                            raise ValueError(
-                                "ABORT_ACK must contain exactly four frames"
-                            )
-                        ack_aborted_room = int(msg[1].decode("ascii"))
-                        prefill_rank = int(msg[2].decode("ascii"))
-                        generation = validate_transfer_generation(
-                            msg[3].decode("ascii")
+                    ack_aborted_room = int(msg[1].decode("ascii"))
+                    logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
+                    # Deferred release: the 3-frame ack carries the prefill rank
+                    # and means its transfer drained; aggregate for is_abort_release_safe.
+                    if self.enable_deferred_decode_kv_release and len(msg) >= 3:
+                        self.note_abort_ack(
+                            ack_aborted_room, int(msg[2].decode("ascii"))
                         )
-                    except (UnicodeDecodeError, ValueError):
-                        logger.warning(
-                            "Ignoring generation-less or malformed ABORT_ACK"
-                        )
-                    else:
-                        logger.debug("Received ABORT_ACK for room %s", ack_aborted_room)
-                        self.note_abort_ack(ack_aborted_room, generation, prefill_rank)
                     continue
 
-                if msg[0] == MOONCAKE_TRANSFER_STATUS_WIRE_TAG:
-                    self._handle_transfer_status(msg)
-                    continue
-                logger.warning(
-                    "Dropping unknown, legacy, or malformed Mooncake control frame: %r",
-                    msg[0][:32] if msg else b"",
-                )
+                bootstrap_room, status, prefill_rank = msg
+                status = int(status.decode("ascii"))
+                bootstrap_room = int(bootstrap_room.decode("ascii"))
+                prefill_rank = int(prefill_rank.decode("ascii"))
+
+                if status == KVPoll.Success:
+                    if bootstrap_room in self.request_status:
+                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+                        expected_response_num = (
+                            self.required_prefill_response_num_table[bootstrap_room]
+                        )
+                        arrived_response_num = len(
+                            self.prefill_response_tracker[bootstrap_room]
+                        )
+                        if arrived_response_num == expected_response_num:
+                            if self.enable_staging:
+                                handler = self._staging_handler
+                                if handler.is_staging_room(bootstrap_room):
+                                    handler.submit_last_scatter_async(bootstrap_room)
+                            self.update_status(bootstrap_room, KVPoll.Success)
+                elif status == KVPoll.Failed:
+                    self.record_failure(
+                        bootstrap_room,
+                        "Failed to get kvcache from prefill instance, it might be dead",
+                    )
+                    self.update_status(bootstrap_room, status)
 
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()
-
-    def _handle_chunk_ready(self, msg: List[bytes]) -> bool:
-        try:
-            if len(msg) != 8 or msg[0] != MOONCAKE_CHUNK_READY_WIRE_TAG:
-                raise ValueError("unsupported CHUNK_READY wire layout")
-            generation = validate_transfer_generation(msg[1].decode("ascii"))
-            room = _parse_mooncake_control_uint(msg[2], "room")
-            chunk_idx = _parse_mooncake_control_uint(msg[3], "chunk index")
-            page_start = _parse_mooncake_control_uint(msg[4], "page start")
-            num_pages = _parse_mooncake_control_uint(
-                msg[5], "page count", positive=True
-            )
-            session_id = msg[6].decode("ascii")
-            if not session_id:
-                raise ValueError("CHUNK_READY session must be non-empty")
-            prefill_rank = _parse_mooncake_control_uint(msg[7], "prefill rank")
-        except (
-            AttributeError,
-            IndexError,
-            TypeError,
-            UnicodeError,
-            ValueError,
-        ) as error:
-            logger.warning("Dropping malformed or legacy CHUNK_READY: %s", error)
-            return False
-
-        with self._abort_state_lock:
-            lease = self._receive_transfer_leases.get(room)
-            if not self._receive_control_matches_unlocked(
-                lease,
-                generation,
-                prefill_rank,
-                session_id=session_id,
-            ):
-                logger.warning(
-                    "Dropping stale or unexpected-rank CHUNK_READY room=%s "
-                    "generation=%s rank=%s",
-                    room,
-                    generation,
-                    prefill_rank,
-                )
-                return False
-            handler = self._staging_handler
-            if handler is None:
-                logger.warning("CHUNK_READY received before staging initialization")
-                return False
-            handler.handle_chunk_arrived(
-                room,
-                chunk_idx,
-                page_start,
-                num_pages,
-                prefill_rank,
-            )
-            return True
-
-    def _handle_transfer_status(self, msg: List[bytes]) -> bool:
-        try:
-            if len(msg) != 5 or msg[0] != MOONCAKE_TRANSFER_STATUS_WIRE_TAG:
-                raise ValueError("unsupported TRANSFER_STATUS wire layout")
-            generation = validate_transfer_generation(msg[1].decode("ascii"))
-            room = _parse_mooncake_control_uint(msg[2], "room")
-            status = _parse_mooncake_control_uint(msg[3], "status")
-            prefill_rank = _parse_mooncake_control_uint(msg[4], "prefill rank")
-            if status not in (KVPoll.Success, KVPoll.Failed):
-                raise ValueError("TRANSFER_STATUS must be Success or Failed")
-        except (
-            AttributeError,
-            IndexError,
-            TypeError,
-            UnicodeError,
-            ValueError,
-        ) as error:
-            logger.warning("Dropping malformed or legacy TRANSFER_STATUS: %s", error)
-            return False
-
-        with self._abort_state_lock:
-            lease = self._receive_transfer_leases.get(room)
-            if not self._receive_control_matches_unlocked(
-                lease, generation, prefill_rank
-            ):
-                logger.warning(
-                    "Dropping stale or unexpected-rank TRANSFER_STATUS room=%s "
-                    "generation=%s rank=%s",
-                    room,
-                    generation,
-                    prefill_rank,
-                )
-                return False
-            if status == KVPoll.Failed:
-                self.record_failure(
-                    room,
-                    "Failed to get kvcache from prefill instance, it might be dead",
-                )
-                self.update_status(room, KVPoll.Failed)
-                return True
-
-            self.prefill_response_tracker[room].add(prefill_rank)
-            if self.prefill_response_tracker[room] != lease.expected_prefill_ranks:
-                return True
-            if self.enable_staging:
-                handler = self._staging_handler
-                if handler is not None and handler.is_staging_room(room):
-                    handler.submit_last_scatter_async(room)
-            self.update_status(room, KVPoll.Success)
-            return True
 
     def add_transfer_request(
         self,
@@ -2756,46 +2499,10 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        transfer_generation: Optional[str] = None,
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
-        super().__init__(
-            mgr,
-            bootstrap_addr,
-            bootstrap_room,
-            transfer_generation=transfer_generation,
-        )
-        # Publish the generation before any delayed control can be attributed
-        # to the freshly created room. Rank identity is bound after bootstrap.
-        self.kv_mgr._register_receive_transfer_lease(
-            self.bootstrap_room,
-            self.transfer_generation,
-            self.session_id,
-        )
-
-    def init(self, prefill_dp_rank: int):
-        super().init(prefill_dp_rank)
-        if self.conclude_state == KVPoll.Failed:
-            return
-        expected_prefill_ranks = frozenset(
-            bootstrap_info["prefill_unique_rank"]
-            for bootstrap_info in self.bootstrap_infos
-            if not bootstrap_info["is_dummy"]
-        )
-        self.kv_mgr._register_receive_transfer_lease(
-            self.bootstrap_room,
-            self.transfer_generation,
-            self.session_id,
-            expected_prefill_ranks,
-        )
-
-    def clear(self) -> None:
-        # The exact-generation compare and all room-keyed state removal share
-        # one lock; a delayed clear from lease A cannot erase lease B.
-        self.kv_mgr._clear_receive_transfer_lease(
-            self.bootstrap_room, self.transfer_generation
-        )
+        super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -2937,7 +2644,6 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 if not is_dummy and device_kv_indices is not None
                                 else b""
                             ),
-                            self.transfer_generation.encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:

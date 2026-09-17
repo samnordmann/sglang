@@ -14,8 +14,6 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
-    STAGING_REQ_WIRE_TAG,
-    STAGING_RSP_WIRE_TAG,
     handle_staging_req,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -260,11 +258,9 @@ class TestStagingWatermark(unittest.TestCase):
 
 class TestMooncakePPStaging(unittest.TestCase):
     def test_staging_response_targets_requesting_pp_rank(self):
-        generation = "0123456789abcdef0123456789abcdef"
         sock = Mock()
         receiver = SimpleNamespace(
             chunk_staging_infos=[],
-            transfer_generation=generation,
             _connect_to_bootstrap_server=Mock(return_value=(sock, threading.Lock())),
         )
         allocator = SimpleNamespace(
@@ -279,15 +275,7 @@ class TestMooncakePPStaging(unittest.TestCase):
         target = {"pp_rank": 3}
 
         handle_staging_req(
-            [
-                STAGING_REQ_WIRE_TAG,
-                generation.encode("ascii"),
-                b"7",
-                b"0",
-                b"1",
-                b"peer",
-                b"3",
-            ],
+            [b"STAGING_REQ", b"7", b"0", b"1", b"peer", b"3"],
             allocator,
             kv_args,
             attn_tp_size=16,
@@ -299,9 +287,6 @@ class TestMooncakePPStaging(unittest.TestCase):
 
         receiver._connect_to_bootstrap_server.assert_called_once_with(target)
         sock.send_multipart.assert_called_once()
-        response = sock.send_multipart.call_args.args[0]
-        self.assertEqual(response[0], STAGING_RSP_WIRE_TAG)
-        self.assertEqual(response[1], generation.encode("ascii"))
 
     @patch(
         "sglang.srt.disaggregation.common.staging_buffer.gather_all_layers_to_staging"

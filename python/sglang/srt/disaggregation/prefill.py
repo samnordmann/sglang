@@ -1191,14 +1191,6 @@ class SchedulerDisaggregationPrefillMixin:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
-        # Early-send is safe only when the selected data plane can defer source
-        # access until the transfer worker consumes the recorded CUDA event.
-        # Keep the capability gate explicit for alternate sender implementations.
-        if self.enable_overlap and not getattr(
-            req.disagg_kv_sender, "supports_overlap_early_send", True
-        ):
-            return
-
         # Staging sends into positional grid slots, so the early-send boundary
         # must stay stable across the request's batches: snapshot the at-rest
         # prefix on the first batch. Non-staging reads the live prefix.

@@ -12,7 +12,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class TestNixlSenderFailureCleanup(unittest.TestCase):
     def test_failure_exception_cleans_room_state_before_raising(self):
         room = 7
-        generation = "0123456789abcdef0123456789abcdef"
         expected_exc = RuntimeError("transfer failed")
         sender = NixlKVSender.__new__(NixlKVSender)
         sender.bootstrap_room = room
@@ -21,10 +20,7 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
         sender._send_error = None
         staging_ctx = SimpleNamespace(
             prefetched_rooms={room, 8},
-            prefetch_requested={
-                (room, generation, 0, "session-a"),
-                (8, generation, 0, "session-b"),
-            },
+            prefetch_requested={(room, 0, "session-a"), (8, 0, "session-b")},
         )
         sender.kv_mgr = SimpleNamespace(
             enable_staging=True,
@@ -49,11 +45,9 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
         self.assertNotIn(room, sender.kv_mgr.exceptions)
         self.assertNotIn(room, sender.kv_mgr.failure_records)
         self.assertNotIn(room, staging_ctx.prefetched_rooms)
-        self.assertNotIn(
-            (room, generation, 0, "session-a"), staging_ctx.prefetch_requested
-        )
+        self.assertNotIn((room, 0, "session-a"), staging_ctx.prefetch_requested)
         self.assertIn(8, staging_ctx.prefetched_rooms)
-        self.assertIn((8, generation, 0, "session-b"), staging_ctx.prefetch_requested)
+        self.assertIn((8, 0, "session-b"), staging_ctx.prefetch_requested)
 
 
 if __name__ == "__main__":

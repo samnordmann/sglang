@@ -3,13 +3,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import dataclasses
-import hashlib
 import logging
-import secrets
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -51,57 +49,6 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
-
-_TRANSFER_GENERATION_NBYTES = 16
-
-
-def validate_transfer_generation(value: object) -> str:
-    """Return one canonical, wire-safe 128-bit decode-room lease identity."""
-
-    if type(value) is not str or len(value) != 2 * _TRANSFER_GENERATION_NBYTES:
-        raise ValueError("transfer generation must be a 32-character string")
-    if value.lower() != value:
-        raise ValueError("transfer generation must use canonical lowercase hex")
-    try:
-        decoded = bytes.fromhex(value)
-    except ValueError as exc:
-        raise ValueError(
-            "transfer generation must use canonical lowercase hex"
-        ) from exc
-    if len(decoded) != _TRANSFER_GENERATION_NBYTES:
-        raise ValueError("transfer generation must encode exactly 128 bits")
-    return value
-
-
-def next_transfer_generation(value: object) -> str:
-    """Derive the next shared identity for a true-retraction rebootstrap.
-
-    The initial value is minted randomly at ingress. Chaining a domain-separated
-    128-bit BLAKE2 digest lets every decode TP rank independently derive the
-    same fresh lease without reusing the retired generation or coordinating a
-    new random value through the data plane.
-    """
-
-    generation = validate_transfer_generation(value)
-    return hashlib.blake2b(
-        bytes.fromhex(generation),
-        digest_size=_TRANSFER_GENERATION_NBYTES,
-        person=b"sgl-pd-reboot-v1",
-    ).hexdigest()
-
-
-@dataclasses.dataclass(frozen=True)
-class _AbortAckTarget:
-    decode_ip: str
-    decode_port: int
-
-
-@dataclasses.dataclass
-class _DeferredAbortTracker:
-    """Exact, immutable writer set and the ACKs adopted for one room lease."""
-
-    expected_prefill_ranks: FrozenSet[int]
-    acked_prefill_ranks: Set[int] = dataclasses.field(default_factory=set)
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -217,10 +164,9 @@ class CommonKVManager(BaseKVManager):
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
-        # Compatibility/readback only. Correctness paths no longer branch on
-        # this value, so even an in-process mutation cannot bypass quarantine.
-        self.enable_deferred_decode_kv_release = True
-        self._abort_state_lock = threading.Lock()
+        self.enable_deferred_decode_kv_release = (
+            envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+        )
         self._dcp_pack_buffers = None
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
@@ -297,12 +243,7 @@ class CommonKVManager(BaseKVManager):
             self.transfer_infos = {}
             # Deferred KV release: aborted room -> (decode_ip, decode_port);
             # ack held until the transfer drains.
-            self._deferred_ack_targets: Dict[Tuple[int, str], _AbortAckTarget] = {}
-            self._active_transfer_generations: Dict[int, str] = {}
-            # Without ACK-of-ACK, eviction could discard the only proof needed
-            # to replay a lost-return ACK. These cold-path tombstones therefore
-            # remain for the process lifetime.
-            self._abort_ack_receipts: Set[Tuple[int, str]] = set()
+            self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -324,9 +265,7 @@ class CommonKVManager(BaseKVManager):
             # Deferred KV release: room -> prefill ranks that acked their transfer
             # drained. Entry exists only while the room is held, so a stale/late
             # ack for a reused bootstrap_room is dropped.
-            self._deferred_abort_ack_tracker: Dict[
-                Tuple[int, str], _DeferredAbortTracker
-            ] = {}
+            self._deferred_abort_ack_tracker: Dict[int, Set[int]] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -444,145 +383,27 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
-    def register_deferred_abort_room(
-        self,
-        bootstrap_room: int,
-        transfer_generation: str,
-        expected_prefill_ranks: FrozenSet[int],
-    ) -> None:
-        """Publish the exact abort intent before any ABORT send can complete."""
+    def register_deferred_abort_room(self, bootstrap_room: int) -> None:
+        """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
+        from a prior request that reused this bootstrap_room."""
+        self._deferred_abort_ack_tracker[bootstrap_room] = set()
 
-        key = (int(bootstrap_room), validate_transfer_generation(transfer_generation))
-        expected = frozenset(expected_prefill_ranks)
-        if not expected or any(type(rank) is not int or rank < 0 for rank in expected):
-            raise ValueError(
-                "expected prefill ranks must be non-empty non-negative ints"
-            )
-        with self._abort_state_lock:
-            tracker = self._deferred_abort_ack_tracker.get(key)
-            if tracker is None:
-                self._deferred_abort_ack_tracker[key] = _DeferredAbortTracker(expected)
-            elif tracker.expected_prefill_ranks != expected:
-                raise RuntimeError("abort intent cannot change its expected writer set")
+    def note_abort_ack(self, bootstrap_room: int, prefill_rank: int) -> None:
+        """Record a prefill rank's drain ack (decode receiver thread). Only counts
+        while the room is held; grabs the set by reference to avoid racing clear."""
+        acks = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if acks is not None:
+            acks.add(prefill_rank)
 
-    def note_abort_ack(
-        self, bootstrap_room: int, transfer_generation: str, prefill_rank: int
-    ) -> bool:
-        """Adopt an ACK only for the exact currently quarantined room lease."""
+    def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
+        """True once every prefill rank that could still write these pages has acked."""
+        return (
+            len(self._deferred_abort_ack_tracker.get(bootstrap_room, ()))
+            >= required_acks
+        )
 
-        try:
-            generation = validate_transfer_generation(transfer_generation)
-        except ValueError:
-            return False
-        if type(prefill_rank) is not int or prefill_rank < 0:
-            return False
-        key = (int(bootstrap_room), generation)
-        with self._abort_state_lock:
-            tracker = self._deferred_abort_ack_tracker.get(key)
-            if tracker is None or prefill_rank not in tracker.expected_prefill_ranks:
-                return False
-            tracker.acked_prefill_ranks.add(prefill_rank)
-            return True
-
-    def is_abort_release_safe(
-        self,
-        bootstrap_room: int,
-        transfer_generation: str,
-    ) -> bool:
-        """True only after every possible writer ACKs this exact lease."""
-
-        key = (int(bootstrap_room), validate_transfer_generation(transfer_generation))
-        with self._abort_state_lock:
-            tracker = self._deferred_abort_ack_tracker.get(key)
-            return bool(
-                tracker is not None
-                and tracker.acked_prefill_ranks == tracker.expected_prefill_ranks
-            )
-
-    def clear_deferred_abort_state(
-        self, bootstrap_room: int, transfer_generation: str
-    ) -> None:
-        key = (int(bootstrap_room), validate_transfer_generation(transfer_generation))
-        with self._abort_state_lock:
-            self._deferred_abort_ack_tracker.pop(key, None)
-
-    def register_transfer_generation(
-        self, bootstrap_room: int, transfer_generation: str
-    ) -> bool:
-        """Atomically bind fresh metadata, rejecting retired or active ABA."""
-
-        room = int(bootstrap_room)
-        generation = validate_transfer_generation(transfer_generation)
-        with self._abort_state_lock:
-            if (room, generation) in self._abort_ack_receipts:
-                return False
-            current = self._active_transfer_generations.get(room)
-            if current is not None and current != generation:
-                return False
-            self._active_transfer_generations[room] = generation
-            return True
-
-    def active_transfer_generation(self, bootstrap_room: int) -> Optional[str]:
-        with self._abort_state_lock:
-            return self._active_transfer_generations.get(int(bootstrap_room))
-
-    def _remember_abort_receipt_unlocked(self, key: Tuple[int, str]) -> None:
-        self._abort_ack_receipts.add(key)
-
-    def mark_transfer_quiescent(
-        self, bootstrap_room: int, transfer_generation: Optional[str] = None
-    ) -> bool:
-        """Journal exact remote-writer quiescence before room teardown.
-
-        The writer-count test and receipt publication share one critical
-        section with writer admission. A caller can therefore never retire a
-        generation between a sibling worker's increment and its DMA.
-        """
-
-        room = int(bootstrap_room)
-        with self._abort_state_lock:
-            if self._staging_outstanding.get(room, 0) > 0:
-                return False
-            generation = transfer_generation or self._active_transfer_generations.get(
-                room
-            )
-            if generation is None:
-                return False
-            generation = validate_transfer_generation(generation)
-            key = (room, generation)
-            self._remember_abort_receipt_unlocked(key)
-            if self._active_transfer_generations.get(room) == generation:
-                self._active_transfer_generations.pop(room, None)
-        self._maybe_ack_drained_abort(room, generation)
-        return True
-
-    def _count_transfer_writer(self, room: int) -> int:
-        """Admit one dequeued writer into the exact shared drain count."""
-
-        room = int(room)
-        with self._abort_state_lock:
-            count = self._staging_outstanding.get(room, 0) + 1
-            self._staging_outstanding[room] = count
-            return count
-
-    def _uncount_transfer_writer(self, room: int) -> int:
-        """Retire exactly one writer, never a concurrently active sibling."""
-
-        room = int(room)
-        with self._abort_state_lock:
-            count = self._staging_outstanding.get(room, 0)
-            if count <= 0:
-                raise RuntimeError(f"transfer-writer count underflow for room {room}")
-            remaining = count - 1
-            if remaining:
-                self._staging_outstanding[room] = remaining
-            else:
-                self._staging_outstanding.pop(room, None)
-            return remaining
-
-    def _transfer_writer_count(self, room: int) -> int:
-        with self._abort_state_lock:
-            return self._staging_outstanding.get(int(room), 0)
+    def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
+        self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
 
     def _prefill_unique_rank(self) -> int:
         """Stable per-sender id, matching what the transfer worker syncs on Success."""
@@ -592,14 +413,8 @@ class CommonKVManager(BaseKVManager):
             + self.attn_cp_rank
         )
 
-    def _send_abort_ack(
-        self,
-        decode_ip: str,
-        decode_port: int,
-        room: int,
-        transfer_generation: str,
-    ) -> bool:
-        """Send an idempotent generation-keyed ACK; report normal return only."""
+    def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
+        """Best-effort ack that this rank's transfer for an aborted room drained."""
         try:
             na = NetworkAddress(decode_ip, decode_port)
             self._send_multipart_locked(
@@ -608,82 +423,28 @@ class CommonKVManager(BaseKVManager):
                     b"ABORT_ACK",
                     str(room).encode("ascii"),
                     str(self._prefill_unique_rank()).encode("ascii"),
-                    transfer_generation.encode("ascii"),
                 ],
                 is_ipv6=na.is_ipv6,
             )
-            return True
         except Exception as e:
-            logger.debug(
-                "Failed to send drained ABORT_ACK for room %s generation %s: %s",
-                room,
-                transfer_generation,
-                e,
-            )
-            return False
+            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
 
-    def _maybe_ack_drained_abort(
-        self, room: int, transfer_generation: Optional[str] = None
-    ) -> None:
-        """Replay a durable ACK only after exact-generation quiescence."""
-        with self._abort_state_lock:
-            if self._staging_outstanding.get(int(room), 0) > 0:
-                return
-            if transfer_generation is None:
-                keys = tuple(
-                    key for key in self._deferred_ack_targets if key[0] == int(room)
-                )
-            else:
-                generation = validate_transfer_generation(transfer_generation)
-                keys = ((int(room), generation),)
-            sends = []
-            for key in keys:
-                target = self._deferred_ack_targets.get(key)
-                if target is None:
-                    continue
-                if key not in self._abort_ack_receipts:
-                    active = self._active_transfer_generations.get(int(room))
-                    status = self.request_status.get(int(room))
-                    if active != key[1] or status != KVPoll.Failed:
-                        continue
-                    self._remember_abort_receipt_unlocked(key)
-                    self._active_transfer_generations.pop(int(room), None)
-                sends.append((key, target))
-        for key, target in sends:
-            if self._send_abort_ack(
-                target.decode_ip,
-                target.decode_port,
-                key[0],
-                key[1],
-            ):
-                with self._abort_state_lock:
-                    if self._deferred_ack_targets.get(key) == target:
-                        self._deferred_ack_targets.pop(key, None)
+    def _maybe_ack_drained_abort(self, room: int) -> None:
+        """Send the deferred ack once an aborted room's chunks have drained
+        (outstanding == 0). pop() makes it fire at most once."""
+        if self._staging_outstanding.get(room, 0) > 0:
+            return
+        target = self._deferred_ack_targets.pop(room, None)
+        if target is not None:
+            self._send_abort_ack(target[0], target[1], room)
 
     def register_deferred_ack_target(
-        self,
-        room: int,
-        transfer_generation: str,
-        decode_ip: str,
-        decode_port: int,
-    ) -> bool:
-        """Journal a target only for an active or already-quiescent exact lease."""
-
-        room = int(room)
-        generation = validate_transfer_generation(transfer_generation)
-        key = (room, generation)
-        target = _AbortAckTarget(str(decode_ip), int(decode_port))
-        with self._abort_state_lock:
-            if (
-                self._active_transfer_generations.get(room) != generation
-                and key not in self._abort_ack_receipts
-            ):
-                return False
-            current_target = self._deferred_ack_targets.get(key)
-            if current_target is not None and current_target != target:
-                return False
-            self._deferred_ack_targets[key] = target
-            return True
+        self, room: int, decode_ip: str, decode_port: int
+    ) -> None:
+        """Hold this room's ack until its transfer drains. Callers must mark the
+        room Failed FIRST -- registering while it still accepts chunks lets the
+        worker ack, then a new chunk writes pages the decode already released."""
+        self._deferred_ack_targets[room] = (decode_ip, decode_port)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1580,8 +1341,10 @@ class CommonKVSender(BaseKVSender):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
-        # A generation-keyed ACK target is a durable ownership journal. Only a
-        # normally returned ACK send may remove it; sender clear is not proof.
+        if hasattr(self.kv_mgr, "_deferred_ack_targets"):
+            # Drop a held ack target if the room concluded without draining
+            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
+            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1604,18 +1367,8 @@ class CommonKVReceiver(BaseKVReceiver):
         mgr: CommonKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        transfer_generation: Optional[str] = None,
     ):
         self.bootstrap_room = bootstrap_room
-        # Current request plumbing supplies one value before scheduler fanout,
-        # so every decode rank targeting the same prefill manager uses one
-        # lease identity. The fallback preserves direct legacy construction.
-        generation = (
-            secrets.token_hex(_TRANSFER_GENERATION_NBYTES)
-            if transfer_generation is None
-            else validate_transfer_generation(transfer_generation)
-        )
-        self._transfer_generation = generation
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
         self.conclude_state: Optional[KVPoll] = None
@@ -1625,12 +1378,6 @@ class CommonKVReceiver(BaseKVReceiver):
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-
-    @property
-    def transfer_generation(self) -> str:
-        """Immutable generation shared by all ranks of this room lease."""
-
-        return self._transfer_generation
 
     def init(self, prefill_dp_rank: int):
         if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
@@ -1690,15 +1437,6 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            bootstrap_info["prefill_unique_rank"] = (
-                                target_tp_rank
-                                * (
-                                    self.prefill_info.pp_size
-                                    * self.prefill_info.attn_cp_size
-                                )
-                                + target_pp_rank * self.prefill_info.attn_cp_size
-                                + target_cp_rank
-                            )
                             if self.kv_mgr.is_mla_backend:
                                 # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
                                 bootstrap_info["is_dummy"] = not bool(
@@ -1870,9 +1608,13 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.invalidate_cached_bootstrap_infos()
-        if hasattr(self, "bootstrap_infos") and self.bootstrap_infos is not None:
-            self.arm_abort_intent()
+        if (
+            not self.abort_notified
+            and hasattr(self, "bootstrap_infos")
+            and self.bootstrap_infos is not None
+        ):
             self._send_abort_notification()
+            self.abort_notified = True
         return KVPoll.Failed
 
     def clear(self) -> None:
@@ -1881,52 +1623,19 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 
     def abort(self):
-        self.arm_abort_intent()
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
-        if hasattr(self, "bootstrap_infos") and self.bootstrap_infos is not None:
-            self._send_abort_notification()
-
-    def arm_abort_intent(self) -> None:
-        """Publish quarantine ownership before the first fallible wire send."""
-
-        if self.abort_notified:
-            return
-        bootstrap_infos = getattr(self, "bootstrap_infos", None)
-        if not bootstrap_infos:
-            # Without rank discovery there is no authenticated writer set. Any
-            # deferred owner therefore remains quarantined and cannot become
-            # release-safe from a fabricated empty set.
-            logger.error(
-                "Cannot arm ABORT for room %s generation %s before exact "
-                "prefill-rank discovery; decode pages will remain quarantined",
-                self.bootstrap_room,
-                self.transfer_generation,
-            )
-            return
-        expected_prefill_ranks = frozenset(
-            bootstrap_info["prefill_unique_rank"] for bootstrap_info in bootstrap_infos
-        )
-        self.kv_mgr.register_deferred_abort_room(
-            self.bootstrap_room,
-            self.transfer_generation,
-            expected_prefill_ranks,
-        )
-        self.abort_notified = True
-
-    def retry_abort_notification(self) -> None:
-        """Replay an armed ABORT; duplicate delivery is generation-idempotent."""
-
         if (
-            self.abort_notified
+            not self.abort_notified
             and hasattr(self, "bootstrap_infos")
             and self.bootstrap_infos is not None
         ):
             self._send_abort_notification()
+            self.abort_notified = True
 
     def _send_abort_notification(self):
         for bootstrap_info in self.bootstrap_infos:
@@ -1940,7 +1649,6 @@ class CommonKVReceiver(BaseKVReceiver):
                             str(self.bootstrap_room).encode("ascii"),
                             self.kv_mgr.local_ip.encode("ascii"),
                             str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.transfer_generation.encode("ascii"),
                         ]
                     )
                 logger.debug(

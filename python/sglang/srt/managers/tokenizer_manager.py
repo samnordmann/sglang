@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import pickle
-import secrets
 import signal
 import socket
 import sys
@@ -1427,9 +1426,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
-                transfer_generation=(
-                    secrets.token_hex(16) if bootstrap_room is not None else None
-                ),
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 cache_salt=obj.cache_salt,
