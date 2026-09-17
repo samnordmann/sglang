@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.disaggregation.common.conn import validate_transfer_generation
 from sglang.srt.runtime_context import (
     get_schedule,
 )
@@ -26,6 +27,10 @@ logger = logging.getLogger(__name__)
 # Bounded wait for a watermark advance before re-enqueueing a deferred staging
 # chunk, so the re-enqueue retry does not busy-spin a core.
 STAGING_WATERMARK_WAIT_S = 0.001
+STAGING_REQ_WIRE_TAG = b"STAGING_REQ_V2"
+STAGING_RSP_WIRE_TAG = b"STAGING_RSP_V2"
+_MAX_STAGING_INT_DIGITS = 20
+_MAX_STAGING_SESSION_BYTES = 4096
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -99,8 +104,10 @@ class DecodeStagingHandler:
         # before unregister runs, but release_room still needs it.
         self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
-        # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
-        # arrivals; handler-owned so room teardown can purge them.
+        # room -> chunk_idx -> {exact_writer_id: (page_start, num_pages)} fan-in;
+        # handler-owned so room teardown can purge it. A map is required here:
+        # duplicate completion traffic from one rank must not impersonate the
+        # other writers needed to authorize scatter.
         self._writer_counts: dict = {}
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
@@ -307,11 +314,37 @@ class DecodeStagingHandler:
             )
             return False
         room_counts = self._writer_counts.setdefault(room, {})
-        arrivals = room_counts.setdefault(chunk_idx, [])
-        arrivals.append((page_start, num_pages, writer_id))
+        arrivals = room_counts.setdefault(chunk_idx, {})
+        arrival = (page_start, num_pages)
+        previous = arrivals.get(writer_id)
+        if previous is not None:
+            if previous != arrival:
+                logger.error(
+                    "Conflicting duplicate staging completion room=%s chunk=%s "
+                    "writer=%s prior=%s current=%s",
+                    room,
+                    chunk_idx,
+                    writer_id,
+                    previous,
+                    arrival,
+                )
+            return False
+        arrivals[writer_id] = arrival
         num_writers = self.num_writers_for(receiver)
         if len(arrivals) >= num_writers:
-            self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+            layouts = set(arrivals.values())
+            if len(layouts) != 1:
+                logger.error(
+                    "Conflicting staging completion layouts room=%s chunk=%s: %s",
+                    room,
+                    chunk_idx,
+                    layouts,
+                )
+                return False
+            scatter_page_start, scatter_num_pages = next(iter(layouts))
+            self.submit_chunk_scatter(
+                room, chunk_idx, scatter_page_start, scatter_num_pages
+            )
             del room_counts[chunk_idx]
             return True
         return False
@@ -502,27 +535,99 @@ def handle_watermark_msg(staging_ctx, msg_parts) -> None:
         staging_ctx.watermark_cv.notify_all()
 
 
-def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
-    """Process a STAGING_RSP message and update transfer info with allocation."""
-    stg_room = int(msg_parts[1].decode("ascii"))
-    stg_chunk_idx = int(msg_parts[2].decode("ascii"))
-    stg_offset = int(msg_parts[3].decode("ascii"))
-    stg_round = int(msg_parts[4].decode("ascii"))
-    stg_end = int(msg_parts[5].decode("ascii"))
-    stg_session = msg_parts[6].decode("ascii")
+def _parse_staging_int(frame, field: str, *, minimum: int = 0) -> int:
+    if type(frame) is not bytes:
+        raise ValueError(f"{field} must be exact bytes")
+    value = frame.decode("ascii")
+    digits = value[1:] if value.startswith("-") else value
+    if (
+        not digits
+        or len(digits) > _MAX_STAGING_INT_DIGITS
+        or not digits.isdecimal()
+        or (len(digits) > 1 and digits[0] == "0")
+        or value == "-0"
+    ):
+        raise ValueError(f"{field} must be canonical bounded decimal")
+    parsed = int(value)
+    if parsed < minimum:
+        raise ValueError(f"{field} must be at least {minimum}")
+    return parsed
+
+
+def _parse_staging_session(frame) -> str:
+    if type(frame) is not bytes or not frame or len(frame) > _MAX_STAGING_SESSION_BYTES:
+        raise ValueError("staging session must be non-empty bounded bytes")
+    return frame.decode("ascii")
+
+
+def _parse_staging_req(msg):
+    if len(msg) not in (6, 7) or msg[0] != STAGING_REQ_WIRE_TAG:
+        raise ValueError("unsupported STAGING_REQ wire layout")
+    generation = validate_transfer_generation(msg[1].decode("ascii"))
+    room = _parse_staging_int(msg[2], "staging room")
+    chunk_idx = _parse_staging_int(msg[3], "staging chunk")
+    chunk_num_pages = _parse_staging_int(msg[4], "staging chunk page count", minimum=1)
+    session_id = _parse_staging_session(msg[5])
+    requester_pp_rank = (
+        _parse_staging_int(msg[6], "requester PP rank") if len(msg) == 7 else None
+    )
+    return (
+        generation,
+        room,
+        chunk_idx,
+        chunk_num_pages,
+        session_id,
+        requester_pp_rank,
+    )
+
+
+def handle_staging_rsp(msg_parts, transfer_infos: dict) -> bool:
+    """Adopt an allocation response only for the exact active room lease."""
+    try:
+        if len(msg_parts) != 8 or msg_parts[0] != STAGING_RSP_WIRE_TAG:
+            raise ValueError("unsupported STAGING_RSP wire layout")
+        generation = validate_transfer_generation(msg_parts[1].decode("ascii"))
+        stg_room = _parse_staging_int(msg_parts[2], "staging room")
+        stg_chunk_idx = _parse_staging_int(msg_parts[3], "staging chunk")
+        stg_offset = _parse_staging_int(msg_parts[4], "staging offset", minimum=-2)
+        stg_round = _parse_staging_int(msg_parts[5], "staging round")
+        stg_end = _parse_staging_int(msg_parts[6], "staging end", minimum=-1)
+        stg_session = _parse_staging_session(msg_parts[7])
+    except (AttributeError, IndexError, TypeError, UnicodeError, ValueError) as error:
+        logger.warning("Dropping malformed or legacy STAGING_RSP: %s", error)
+        return False
+
     room_infos = transfer_infos.get(stg_room, {})
     tinfo = room_infos.get(stg_session)
-    if tinfo is not None:
-        if tinfo.staging is None:
-            tinfo.staging = StagingTransferInfo()
-        tinfo.staging.set_chunk(stg_chunk_idx, stg_offset, stg_round, stg_end)
-    else:
+    if tinfo is None:
         logger.warning(
             "STAGING_RSP RECV but tinfo=None room=%s chunk=%d session=%s",
             stg_room,
             stg_chunk_idx,
             stg_session,
         )
+        return False
+    try:
+        active_generation = validate_transfer_generation(tinfo.transfer_generation)
+    except (AttributeError, TypeError, ValueError):
+        logger.warning(
+            "Dropping STAGING_RSP for room=%s with no authenticated active lease",
+            stg_room,
+        )
+        return False
+    if generation != active_generation:
+        logger.warning(
+            "Dropping stale STAGING_RSP room=%s response_generation=%s "
+            "active_generation=%s",
+            stg_room,
+            generation,
+            active_generation,
+        )
+        return False
+    if tinfo.staging is None:
+        tinfo.staging = StagingTransferInfo()
+    tinfo.staging.set_chunk(stg_chunk_idx, stg_offset, stg_round, stg_end)
+    return True
 
 
 # ======================================================================
@@ -768,7 +873,9 @@ def handle_staging_req(
     kv_buffer_tensors,
     room_receivers: dict,
     room_bootstrap: dict,
-):
+    *,
+    parsed_request=None,
+) -> bool:
     """Allocate staging for a chunk on-demand and send STAGING_RSP to prefill.
 
     Deduplicates: multiple prefill TP ranks requesting the same (room, chunk_idx)
@@ -776,11 +883,18 @@ def handle_staging_req(
     """
     from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
-    room = int(msg[1].decode("ascii"))
-    chunk_idx = int(msg[2].decode("ascii"))
-    chunk_num_pages = int(msg[3].decode("ascii"))
-    session_id = msg[4].decode("ascii")
-    requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 else None
+    try:
+        (
+            generation,
+            room,
+            chunk_idx,
+            chunk_num_pages,
+            session_id,
+            requester_pp_rank,
+        ) = parsed_request if parsed_request is not None else _parse_staging_req(msg)
+    except (AttributeError, IndexError, TypeError, UnicodeError, ValueError) as error:
+        logger.warning("Dropping malformed or legacy STAGING_REQ: %s", error)
+        return False
 
     if staging_allocator is None:
         logger.warning(
@@ -788,7 +902,7 @@ def handle_staging_req(
             room,
             chunk_idx,
         )
-        return
+        return False
 
     receiver = room_receivers.get(room)
     if receiver is None:
@@ -798,7 +912,23 @@ def handle_staging_req(
             chunk_idx,
             session_id,
         )
-        return
+        return False
+    try:
+        active_generation = validate_transfer_generation(receiver.transfer_generation)
+    except (AttributeError, TypeError, ValueError):
+        logger.warning(
+            "STAGING_REQ dropped: room=%s has no authenticated active lease", room
+        )
+        return False
+    if generation != active_generation:
+        logger.warning(
+            "STAGING_REQ dropped: stale room=%s request_generation=%s "
+            "active_generation=%s",
+            room,
+            generation,
+            active_generation,
+        )
+        return False
     infos = receiver.chunk_staging_infos
 
     if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
@@ -870,7 +1000,8 @@ def handle_staging_req(
                 with lock:
                     sock.send_multipart(
                         [
-                            b"STAGING_RSP",
+                            STAGING_RSP_WIRE_TAG,
+                            generation.encode("ascii"),
                             str(room).encode("ascii"),
                             str(chunk_idx).encode("ascii"),
                             str(offset).encode("ascii"),
@@ -881,6 +1012,7 @@ def handle_staging_req(
                     )
             except Exception:
                 pass
+    return True
 
 
 class StagingManagerMixin:
@@ -898,8 +1030,18 @@ class StagingManagerMixin:
         return is_watermark_ready(self._staging_ctx, session_id, alloc_round, alloc_end)
 
     def _handle_staging_req(self, msg):
-        room = int(msg[1].decode("ascii"))
-        session_id = msg[4].decode("ascii")
+        try:
+            parsed_request = _parse_staging_req(msg)
+        except (
+            AttributeError,
+            IndexError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ) as error:
+            logger.warning("Dropping malformed or legacy STAGING_REQ: %s", error)
+            return
+        generation, room, _, _, session_id, _ = parsed_request
         handler = self._staging_handler
         assert handler is not None, (
             "STAGING_REQ received before staging handler initialized"
@@ -911,8 +1053,17 @@ class StagingManagerMixin:
                 room,
             )
             return
+        receiver = self._staging_ctx.room_receivers.get(room)
+        if receiver is None or receiver.transfer_generation != generation:
+            logger.warning(
+                "STAGING_REQ received for stale room lease room=%s generation=%s, "
+                "skipping",
+                room,
+                generation,
+            )
+            return
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
-        handle_staging_req(
+        accepted = handle_staging_req(
             msg,
             self._staging_ctx.allocator,
             self.kv_args,
@@ -921,10 +1072,10 @@ class StagingManagerMixin:
             getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
+            parsed_request=parsed_request,
         )
 
-        receiver = self._staging_ctx.room_receivers.get(room)
-        if receiver is not None:
+        if accepted:
             handler.register_wm_subscriber(receiver, session_id)
 
 
@@ -965,7 +1116,8 @@ def prefetch_staging_reqs(
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
 
         for chunk_idx in range(num_chunks):
-            stg_key = (room, chunk_idx, session_id)
+            generation = validate_transfer_generation(tinfo.transfer_generation)
+            stg_key = (room, generation, chunk_idx, session_id)
             if stg_key in staging_requested:
                 continue
             staging_requested.add(stg_key)
@@ -982,7 +1134,8 @@ def prefetch_staging_reqs(
                     sock.connect(ep)
                     prefetch_sockets[ep] = sock
                 request = [
-                    b"STAGING_REQ",
+                    STAGING_REQ_WIRE_TAG,
+                    generation.encode("ascii"),
                     str(room).encode("ascii"),
                     str(chunk_idx).encode("ascii"),
                     str(chunk_pages).encode("ascii"),

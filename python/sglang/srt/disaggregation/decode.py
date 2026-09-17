@@ -37,7 +37,12 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    next_transfer_generation,
+    validate_transfer_generation,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -631,6 +636,35 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
+        backend = (
+            TransferBackend.FAKE if _is_fake_transfer(req) else self.transfer_backend
+        )
+        if not is_retracted and backend in (
+            TransferBackend.NIXL,
+            TransferBackend.MOONCAKE,
+        ):
+            try:
+                generation = validate_transfer_generation(req.transfer_generation)
+            except ValueError as error:
+                message = (
+                    "Missing or invalid internal transfer generation on a "
+                    f"disaggregated request: {error}"
+                )
+                logger.error(message)
+                prepare_abort(
+                    req,
+                    message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                return
+            if is_rebootstrap:
+                # The completed lease has a process-lifetime tombstone and its
+                # delayed notifications must never match this new transfer.
+                # All TP ranks start from the same ingress generation, so this
+                # deterministic chain advances them to the same next identity.
+                req.transfer_generation = next_transfer_generation(generation)
+
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
@@ -699,10 +733,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
 
+        receiver_kwargs = (
+            {"transfer_generation": req.transfer_generation}
+            if backend in (TransferBackend.NIXL, TransferBackend.MOONCAKE)
+            else {}
+        )
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
             bootstrap_addr=_bootstrap_addr(req),
             bootstrap_room=req.bootstrap_room,
+            **receiver_kwargs,
         )
 
         decode_req = DecodeRequest(
@@ -2029,6 +2069,19 @@ def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
     return int.from_bytes(digest, byteorder="little") % req.vocab_size
 
 
+@dataclass
+class _DeferredKVRelease:
+    decode_req: DecodeRequest
+    bootstrap_room: int
+    kv_receiver: CommonKVReceiver
+    next_diagnostic_at: float
+    metadata_buffer_index: int
+    transfer_generation: str
+    diagnostic_count: int = 0
+    release_phase: str = "QUARANTINED"
+    release_error: Optional[Tuple[str, str]] = None
+
+
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
@@ -2053,15 +2106,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
-        self.enable_deferred_kv_release = (
-            envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
-        )
+        # Non-bypassable: a remote writer must prove quiescence before these
+        # pages or this request slot can be reused.
+        self.enable_deferred_kv_release = True
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
-        # Aborted-mid-transfer requests whose KV pages/slot are held until drained
-        # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
-        self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
+        self._deferred_releases: List[_DeferredKVRelease] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2333,13 +2384,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                if (
-                    self.enable_deferred_kv_release
-                    and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
-                    and decode_req.kv_receiver.abort_notified
-                ):
+                if decode_req.kv_receiver.abort_notified:
                     # Decode-initiated abort: a prefill write may still target
-                    # these pages, so hold them until the drain ack or timeout.
+                    # these pages, so hold them until the exact drain proof.
                     # (A prefill-initiated failure has already stopped writing ->
                     # immediate release below.)
                     self._defer_release(decode_req)
@@ -2412,65 +2459,143 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
         deadline = time.monotonic() + self.deferred_kv_release_timeout
-        # Require an ack from every notified prefill rank (dummy-proof). Snapshot
-        # now -- the receiver may be cleared by resolve time.
-        required_acks = len(decode_req.kv_receiver.bootstrap_infos)
+        receiver = decode_req.kv_receiver
+        receiver.arm_abort_intent()
         self._deferred_releases.append(
-            (decode_req, deadline, decode_req.metadata_buffer_index, required_acks)
+            _DeferredKVRelease(
+                decode_req=decode_req,
+                bootstrap_room=decode_req.req.bootstrap_room,
+                kv_receiver=receiver,
+                next_diagnostic_at=deadline,
+                metadata_buffer_index=decode_req.metadata_buffer_index,
+                transfer_generation=receiver.transfer_generation,
+            )
         )
 
-    def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
-        room = decode_req.req.bootstrap_room
+    def _do_release(self, held: _DeferredKVRelease) -> None:
+        """Run one fail-stop release transaction without replaying a free.
+
+        Each phase is journaled before its fallible or non-idempotent action. If
+        an action commits and its return is lost, the journal blocks automatic
+        retry and prefers a diagnosable leak to a possible double-free.
+        """
+
+        if held.release_phase != "QUARANTINED":
+            raise RuntimeError(
+                f"unsafe deferred release replay from phase {held.release_phase}"
+            )
+        decode_req = held.decode_req
+        receiver = held.kv_receiver
+        room = held.bootstrap_room
+        idx = held.metadata_buffer_index
         if self.enable_staging and self.staging_handler.is_staging_room(room):
+            held.release_phase = "STAGING_RELEASE_ENTERED"
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
+        held.release_phase = "KV_RELEASE_ENTERED"
         release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+        held.release_phase = "METADATA_RESET_ENTERED"
         self.metadata_buffers.bootstrap_room[idx] = 0
+        held.release_phase = "METADATA_INDEX_FREE_ENTERED"
         self.req_to_metadata_buffer_idx_allocator.free(idx)
-        decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
-        decode_req.kv_receiver.clear()
+        held.release_phase = "CONTROL_CLEANUP_ENTERED"
+        receiver.kv_mgr.clear_deferred_abort_state(room, held.transfer_generation)
+        receiver.clear()
         decode_req.kv_receiver = None
+        held.release_phase = "DONE"
 
     def has_pending_deferred_releases(self) -> bool:
         return bool(self._deferred_releases)
 
     def resolve_deferred_releases(self) -> None:
-        """Release held requests once every prefill rank acks the drain, or the
-        hold times out."""
+        """Release only on exact drain proof; timeout retries and diagnoses."""
         if not self._deferred_releases:
             return
         now = time.monotonic()
-        still_held = []
-        to_release = []
-        for decode_req, deadline, idx, required_acks in self._deferred_releases:
-            room = decode_req.req.bootstrap_room
-            kv_mgr = decode_req.kv_receiver.kv_mgr
-            drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
-                still_held.append((decode_req, deadline, idx, required_acks))
-            else:
-                to_release.append((decode_req, idx, room, drained))
-        # Commit the survivors before releasing so a _do_release exception can't
-        # leave a released entry in the list (double-free / None receiver on retry).
-        self._deferred_releases = still_held
-        for decode_req, idx, room, drained in to_release:
-            if not drained:
+        for held in tuple(self._deferred_releases):
+            if held.release_phase == "DONE":
+                self._deferred_releases = [
+                    entry for entry in self._deferred_releases if entry is not held
+                ]
+                continue
+            if held.release_phase != "QUARANTINED":
+                if now >= held.next_diagnostic_at:
+                    logger.error(
+                        "Fail-stop KV release journal retains room %s generation "
+                        "%s in phase %s after %s; automatic retry is unsafe",
+                        held.bootstrap_room,
+                        held.transfer_generation,
+                        held.release_phase,
+                        held.release_error,
+                    )
+                    held.next_diagnostic_at = now + 300.0
+                continue
+            decode_req = held.decode_req
+            receiver = held.kv_receiver
+            room = held.bootstrap_room
+            kv_mgr = receiver.kv_mgr
+            drained = kv_mgr.is_abort_release_safe(room, held.transfer_generation)
+            if drained:
+                try:
+                    self._do_release(held)
+                except BaseException as error:
+                    try:
+                        error_text = str(error)
+                    except BaseException:
+                        error_text = "<exception text unavailable>"
+                    held.release_error = (
+                        f"{type(error).__module__}.{type(error).__qualname__}",
+                        error_text[:512],
+                    )
+                    held.next_diagnostic_at = now + 300.0
+                    logger.exception(
+                        "Deferred KV release entered fail-stop phase %s for "
+                        "room %s generation %s; owner remains quarantined",
+                        held.release_phase,
+                        room,
+                        held.transfer_generation,
+                    )
+                    if not isinstance(error, Exception):
+                        raise
+                else:
+                    self._deferred_releases = [
+                        entry for entry in self._deferred_releases if entry is not held
+                    ]
+                continue
+            if now >= held.next_diagnostic_at:
                 logger.warning(
-                    f"Deferred KV release for room {room} timed out after "
-                    f"{self.deferred_kv_release_timeout}s without a full drain "
-                    f"ack from prefill; releasing anyway."
+                    "Deferred KV quarantine for room %s generation %s has no "
+                    "full drain proof after %.1fs; retaining pages and retrying "
+                    "ABORT (diagnostic %d)",
+                    room,
+                    held.transfer_generation,
+                    self.deferred_kv_release_timeout,
+                    held.diagnostic_count + 1,
                 )
-            try:
-                self._do_release(decode_req, idx)
-            except Exception:
-                # Isolate a failed release so the rest still run; entry already dropped.
-                logger.exception(f"Deferred KV release failed for room {room}")
+                try:
+                    receiver.retry_abort_notification()
+                except Exception:
+                    logger.exception(
+                        "ABORT retry failed for quarantined room %s generation %s",
+                        room,
+                        held.transfer_generation,
+                    )
+                held.diagnostic_count += 1
+                backoff = min(
+                    max(self.deferred_kv_release_timeout, 1.0)
+                    * (2 ** min(held.diagnostic_count, 5)),
+                    300.0,
+                )
+                held.next_diagnostic_at = now + backoff
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        if self._deferred_releases:
+            raise RuntimeError(
+                "Cannot release decode GPU memory while remote-writer "
+                f"quarantine holds {len(self._deferred_releases)} request(s)"
+            )
         self.queue.clear()
-        # Pool is being torn down; drop held entries without per-request release.
-        self._deferred_releases.clear()
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""

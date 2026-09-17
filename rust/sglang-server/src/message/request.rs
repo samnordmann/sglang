@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 use bytes::Bytes;
 use itertools::izip;
 use serde::Deserialize;
+use uuid::Uuid;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::response::ResponseSink;
@@ -29,6 +30,20 @@ use crate::utils::{environ::env_i64, error::Error};
 /// per-request `env::var` would take a lock on the hot path for a constant.
 static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<i64> =
     LazyLock::new(|| env_i64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096));
+
+/// Mint a full-width, OS-seeded 128-bit lease identity without adding another
+/// random-number dependency. UUID v4 supplies 122 random bits and overwrites
+/// six RFC version/variant bits; fill those exact positions from independent
+/// random bytes of a second UUID before rendering canonical lowercase hex.
+fn new_transfer_generation() -> String {
+    let primary = Uuid::new_v4();
+    let refill = Uuid::new_v4();
+    let mut bytes = *primary.as_bytes();
+    let refill_bytes = refill.as_bytes();
+    bytes[6] = (bytes[6] & 0x0f) | (refill_bytes[0] & 0xf0);
+    bytes[8] = (bytes[8] & 0x3f) | (refill_bytes[1] & 0xc0);
+    format!("{:032x}", u128::from_be_bytes(bytes))
+}
 
 fn batch_size_exceeds_limit(batch_size: usize, limit: i64) -> bool {
     limit >= 0 && batch_size as u128 > limit as u128
@@ -414,6 +429,9 @@ impl GenerateBody {
                 return_text_in_logprobs,
                 bootstrap_host,
                 bootstrap_port,
+                transfer_generation: bootstrap_room
+                    .as_ref()
+                    .map(|_| new_transfer_generation()),
                 bootstrap_room,
                 bootstrap_pair_key,
                 decode_tp_size,
@@ -649,6 +667,8 @@ pub struct GenerateRequest {
     /// so these are pure passthrough for the scheduler/LB protocol.
     pub routed_dp_rank: Option<i64>,
     pub disagg_prefill_dp_rank: Option<i64>,
+    /// Internal random room-lease identity, never accepted from the client.
+    pub transfer_generation: Option<String>,
     /// Multimodal inputs, carried opaquely. Consumed by the Encoding stage,
     /// which ships them to the MM worker pool; never read by the tokenizer or
     /// serialized onto the scheduler header. Boxed so the common text-only
@@ -1291,7 +1311,16 @@ mod tests {
             assert_eq!(p.bootstrap_port, Some(8998));
             assert_eq!(p.bootstrap_room, Some(7 + i as i64));
             assert_eq!(p.routed_dp_rank, Some(1));
+            let generation = p.transfer_generation.as_deref().unwrap();
+            assert_eq!(generation.len(), 32);
+            assert!(
+                generation
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "generation must be canonical lowercase 128-bit hex"
+            );
         }
+        assert_ne!(ps[0].transfer_generation, ps[1].transfer_generation);
 
         let (ps, _) = requests(
             r#"{"text": ["a", "b"], "bootstrap_host": ["h1", "h2"],
@@ -1302,6 +1331,7 @@ mod tests {
         assert_eq!(ps[1].bootstrap_host.as_deref(), Some("h2"));
         assert_eq!(ps[0].bootstrap_room, Some(10));
         assert_eq!(ps[1].bootstrap_room, Some(20));
+        assert_ne!(ps[0].transfer_generation, ps[1].transfer_generation);
 
         let err = requests(r#"{"text": ["a", "b"], "bootstrap_room": [1, 2, 3]}"#).unwrap_err();
         assert!(err.to_string().contains("bootstrap_room"), "{err}");

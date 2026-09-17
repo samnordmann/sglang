@@ -6,6 +6,7 @@ import threading
 import types
 import unittest
 from collections import defaultdict
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -13,7 +14,13 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
+from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_REQ_WIRE_TAG,
+    STAGING_RSP_WIRE_TAG,
+    PrefillStagingContext,
+    handle_staging_req,
+    handle_staging_rsp,
+)
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
@@ -23,11 +30,20 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferInfo,
     TransferKVChunk,
     TransferStatus,
+    repeat_indices_over_layers,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+TRANSFER_GENERATION = "11" * 16
+OLD_TRANSFER_GENERATION = "22" * 16
+
+
+def completion_notification(room, suffix, generation=TRANSFER_GENERATION):
+    return f"nixlv2_{generation}_{room}_{suffix}"
 
 
 class NotificationFakeAgent:
@@ -120,6 +136,8 @@ class TestNixlTransferInfo(CustomTestCase):
             b"2",
             pack_int_lists(state_indices, "i"),
             b"11",
+            b"0",
+            TRANSFER_GENERATION.encode("ascii"),
         ]
 
         info = TransferInfo.from_zmq(msg)
@@ -133,6 +151,7 @@ class TestNixlTransferInfo(CustomTestCase):
         self.assertEqual(info.required_dst_info_num, 2)
         self.assertEqual(info.dst_state_indices, state_indices)
         self.assertEqual(info.decode_prefix_len, 11)
+        self.assertEqual(info.transfer_generation, TRANSFER_GENERATION)
 
     def test_from_zmq_defaults_optional_fields(self):
         info = TransferInfo.from_zmq(
@@ -144,6 +163,10 @@ class TestNixlTransferInfo(CustomTestCase):
                 np.array([1], dtype=np.int32).tobytes(),
                 b"0",
                 b"1",
+                b"",
+                b"",
+                b"",
+                TRANSFER_GENERATION.encode("ascii"),
             ]
         )
 
@@ -162,6 +185,8 @@ class TestNixlTransferInfo(CustomTestCase):
                 b"1",
                 b"",
                 b"128",
+                b"",
+                TRANSFER_GENERATION.encode("ascii"),
             ]
         )
 
@@ -179,6 +204,8 @@ class TestNixlTransferInfo(CustomTestCase):
                 b"1",
                 b"",
                 b"0",
+                b"",
+                TRANSFER_GENERATION.encode("ascii"),
             ]
         )
 
@@ -276,8 +303,20 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
 
 
 class TestNixlTransferStatus(CustomTestCase):
+    def test_completion_source_rank_set_is_exact_and_immutable(self):
+        status = TransferStatus(transfer_generation=TRANSFER_GENERATION)
+        status.bind_expected_source_ranks(frozenset({4, 9}))
+
+        self.assertTrue(status.accepts_source_rank(4))
+        for unexpected in (True, -1, 0, 10):
+            self.assertFalse(status.accepts_source_rank(unexpected))
+        self.assertEqual(status.num_pp_ranks_expected, 2)
+        status.bind_expected_source_ranks(frozenset({4, 9}))
+        with self.assertRaises(RuntimeError):
+            status.bind_expected_source_ranks(frozenset({4}))
+
     def test_not_done_until_aux_and_expected_count_arrive(self):
-        status = TransferStatus()
+        status = TransferStatus(transfer_generation=TRANSFER_GENERATION)
 
         self.assertFalse(status.is_done())
 
@@ -294,7 +333,7 @@ class TestNixlTransferStatus(CustomTestCase):
         self.assertTrue(status.is_done())
 
     def test_zero_kv_aux_only_completion(self):
-        status = TransferStatus()
+        status = TransferStatus(transfer_generation=TRANSFER_GENERATION)
         status.received_aux = True
         status.num_pp_ranks_expected = 1
         status.expected_kvs_per_pp[0] = 0
@@ -302,7 +341,7 @@ class TestNixlTransferStatus(CustomTestCase):
         self.assertTrue(status.is_done())
 
     def test_multi_pp_requires_each_rank_expected_chunks(self):
-        status = TransferStatus()
+        status = TransferStatus(transfer_generation=TRANSFER_GENERATION)
         status.received_aux = True
         status.num_pp_ranks_expected = 2
         status.expected_kvs_per_pp[0] = 1
@@ -315,7 +354,7 @@ class TestNixlTransferStatus(CustomTestCase):
         self.assertTrue(status.is_done())
 
     def test_state_required_completion_waits_for_all_pp_ranks(self):
-        status = TransferStatus()
+        status = TransferStatus(transfer_generation=TRANSFER_GENERATION)
         status.received_aux = True
         status.num_pp_ranks_expected = 2
         status.expected_kvs_per_pp[0] = 0
@@ -339,6 +378,148 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertFalse(sender.should_send_kv_chunk(0, last_chunk=False))
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
 
+    def test_both_data_planes_support_overlap_early_send(self):
+        sender = object.__new__(NixlKVSender)
+
+        for use_torch_transfer in (False, True):
+            sender.kv_mgr = SimpleNamespace(_use_torch_transfer=use_torch_transfer)
+            self.assertTrue(sender.supports_overlap_early_send)
+
+    def test_send_consumes_early_send_event_into_transfer_chunk(self):
+        sender = object.__new__(NixlKVSender)
+        wait_event = object()
+        sender._early_send_wait_event = wait_event
+        sender._send_failed = False
+        sender._transfer_start_time = 1.0
+        sender.bootstrap_room = 7
+        sender.chunk_id = 2
+        sender.aux_index = 3
+        sender.has_sent = False
+        sender.kv_mgr = SimpleNamespace(add_transfer_request=MagicMock())
+        prepared_indices = np.array([5], dtype=np.int32)
+        sender._prepare_send_indices = MagicMock(
+            return_value=(
+                prepared_indices,
+                slice(0, 1),
+                False,
+                False,
+            )
+        )
+        sender._record_transfer_indices = MagicMock()
+
+        sender.send(np.array([5], dtype=np.int32), num_kv_tokens=4)
+
+        self.assertIsNone(sender._early_send_wait_event)
+        sender.kv_mgr.add_transfer_request.assert_called_once_with(
+            7,
+            prepared_indices,
+            slice(0, 1),
+            False,
+            2,
+            3,
+            None,
+            4,
+            wait_event=wait_event,
+        )
+
+
+class TestNixlBootstrapErrors(CustomTestCase):
+    def _make_manager(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.enable_staging = False
+        mgr._bootstrap_errors = {}
+        mgr.exceptions = {}
+        mgr.transfer_infos = {}
+        mgr.req_to_decode_prefix_len = {}
+        mgr.prep_handles = {}
+        mgr._handle_abort_notification = MagicMock(return_value=False)
+        mgr.record_failure = MagicMock()
+        mgr.update_status = MagicMock()
+        return mgr
+
+    def test_registration_error_is_propagated_to_later_room(self):
+        mgr = self._make_manager()
+        unsupported = NotImplementedError("unsupported PyTorch transfer topology")
+        mgr._add_remote_peer = MagicMock(side_effect=unsupported)
+        registration_message = [
+            b"NixlMsgGuard",
+            b"None",
+            b"endpoint",
+            b"1234",
+            b"decode-agent",
+        ]
+        room_message = [
+            b"NixlMsgGuard",
+            b"41",
+            b"endpoint",
+            b"1234",
+            b"decode-agent",
+            b"",
+            b"0",
+            b"1",
+            b"",
+            b"",
+            b"0",
+            TRANSFER_GENERATION.encode("ascii"),
+        ]
+
+        with patch.object(KVArgsRegisterInfo, "from_zmq", return_value=object()):
+            with self.assertRaises(NotImplementedError):
+                mgr._handle_bootstrap_message(registration_message)
+        self.assertIs(mgr._bootstrap_errors["decode-agent"], unsupported)
+
+        with self.assertRaises(NotImplementedError):
+            mgr._handle_bootstrap_message(room_message)
+
+        self.assertIs(mgr.exceptions[41], unsupported)
+        mgr.record_failure.assert_called_once_with(41, str(unsupported))
+        mgr.update_status.assert_called_once_with(41, KVPoll.Failed)
+
+    def test_listener_continues_after_message_error(self):
+        mgr = self._make_manager()
+        mgr.server_socket = SimpleNamespace(
+            recv_multipart=MagicMock(side_effect=[[b"bad"], [b"good"], SystemExit()])
+        )
+        mgr._handle_bootstrap_message = MagicMock(
+            side_effect=[ValueError("bad bootstrap"), None]
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.threading.Thread"
+        ) as thread_cls:
+            mgr._start_bootstrap_thread()
+        target = thread_cls.call_args.kwargs["target"]
+
+        with self.assertRaises(SystemExit):
+            target()
+
+        self.assertEqual(mgr._handle_bootstrap_message.call_count, 2)
+        self.assertTrue(thread_cls.call_args.kwargs["daemon"])
+
+    def test_peer_import_failure_does_not_poison_registration_table(self):
+        mgr = self._make_manager()
+        mgr._use_torch_transfer = True
+        mgr.attn_tp_size = 1
+        mgr.disaggregation_mode = object()
+        mgr.decode_kv_args_table = {}
+        mgr.requires_dcp_relayout = MagicMock(return_value=False)
+        mgr.agent = SimpleNamespace(
+            add_remote_agent=MagicMock(side_effect=RuntimeError("metadata rejected"))
+        )
+        peer = SimpleNamespace(
+            agent_name="decode-agent",
+            agent_metadata=b"metadata",
+            decode_tp_size=1,
+            dst_dcp_size=1,
+            dst_dcp_rank=0,
+            dst_kv_mem_kinds=["VRAM"],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "metadata rejected"):
+            mgr._add_remote_peer(peer)
+
+        self.assertNotIn("decode-agent", mgr.decode_kv_args_table)
+
 
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
@@ -347,9 +528,15 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr._connect = MagicMock()
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
-        # These cases cover the legacy no-ack behavior; the deferred-release ack
-        # path is exercised in test_nixl_deferred_kv_release.py.
+        mgr._abort_state_lock = threading.Lock()
+        mgr._deferred_ack_targets = {}
+        mgr._active_transfer_generations = {}
+        mgr._abort_ack_receipts = set()
+        mgr._staging_outstanding = {room: 1 for room in mgr.request_status}
+        mgr._send_abort_ack = MagicMock(return_value=True)
         mgr.enable_deferred_decode_kv_release = False
+        for room in mgr.request_status:
+            mgr.register_transfer_generation(room, TRANSFER_GENERATION)
         return mgr
 
     def test_given_known_incomplete_room_when_abort_arrives_then_room_fails_without_ack(
@@ -358,7 +545,13 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr = self._make_manager({11: KVPoll.WaitingForInput})
 
         handled = mgr._handle_abort_notification(
-            [b"ABORT", b"11", b"127.0.0.1", b"5555"]
+            [
+                b"ABORT",
+                b"11",
+                b"127.0.0.1",
+                b"5555",
+                TRANSFER_GENERATION.encode("ascii"),
+            ]
         )
 
         self.assertTrue(handled)
@@ -373,7 +566,13 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr = self._make_manager({12: KVPoll.Success})
 
         handled = mgr._handle_abort_notification(
-            [b"ABORT", b"12", b"127.0.0.1", b"5556"]
+            [
+                b"ABORT",
+                b"12",
+                b"127.0.0.1",
+                b"5556",
+                TRANSFER_GENERATION.encode("ascii"),
+            ]
         )
 
         self.assertTrue(handled)
@@ -385,7 +584,13 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr = self._make_manager()
 
         handled = mgr._handle_abort_notification(
-            [b"ABORT", b"14", b"127.0.0.1", b"5557"]
+            [
+                b"ABORT",
+                b"14",
+                b"127.0.0.1",
+                b"5557",
+                TRANSFER_GENERATION.encode("ascii"),
+            ]
         )
 
         self.assertTrue(handled)
@@ -397,7 +602,13 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr = self._make_manager({13: KVPoll.WaitingForInput})
 
         handled = mgr._handle_abort_notification(
-            [b"ABORT", b"invalid-room", b"127.0.0.1", b"5558"]
+            [
+                b"ABORT",
+                b"invalid-room",
+                b"127.0.0.1",
+                b"5558",
+                TRANSFER_GENERATION.encode("ascii"),
+            ]
         )
 
         self.assertTrue(handled)
@@ -446,6 +657,7 @@ class TestNixlTransferWorker(CustomTestCase):
                     dst_aux_index=0,
                     required_dst_info_num=1,
                     dst_state_indices=[],
+                    transfer_generation=TRANSFER_GENERATION,
                 )
             }
         }
@@ -472,11 +684,16 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
         mgr._staging_outstanding = defaultdict(int)
+        mgr._abort_state_lock = threading.Lock()
+        mgr._deferred_ack_targets = {}
+        mgr._active_transfer_generations = {room: TRANSFER_GENERATION}
+        mgr._abort_ack_receipts = set()
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
         mgr.transfer_source_rank = 0
         mgr.kv_args = SimpleNamespace(engine_rank=0, kv_data_ptrs=[0])
+        mgr._use_torch_transfer = False
         mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
@@ -518,9 +735,12 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertNotIn(room, mgr.transfer_infos)
         self.assertNotIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_aux.assert_called_once()
-        self.assertEqual(mgr.send_aux.call_args.args[-1], "21_aux_nokv_0_0")
+        self.assertEqual(
+            mgr.send_aux.call_args.args[-1],
+            completion_notification(21, "aux_nokv_0_0"),
+        )
 
-    def test_given_non_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
+    def test_given_non_last_chunk_aborts_mid_transfer_then_failed_room_is_retired(
         self,
     ):
         room = 22
@@ -531,12 +751,247 @@ class TestNixlTransferWorker(CustomTestCase):
         self._run_worker_once(mgr, chunk)
 
         self.assertEqual(mgr.request_status[room], KVPoll.Failed)
-        self.assertIn(room, mgr.transfer_infos)
-        self.assertIn(room, mgr.req_to_decode_prefix_len)
+        self.assertNotIn(room, mgr.transfer_infos)
+        self.assertNotIn(room, mgr.req_to_decode_prefix_len)
+        self.assertIn((room, TRANSFER_GENERATION), mgr._abort_ack_receipts)
         mgr.send_kvcache.assert_called_once()
 
+    def test_waits_for_early_send_event_once_before_source_access(self):
+        for room, use_torch_transfer in ((23, False), (24, True)):
+            with self.subTest(use_torch_transfer=use_torch_transfer):
+                mgr = self._make_manager(room)
+                mgr._use_torch_transfer = use_torch_transfer
+                mgr.agent.progress = MagicMock()
+                actions = []
+                captured_handles = []
+                mgr.agent.begin_handle_batch = lambda handles: captured_handles.append(
+                    handles
+                )
+                mgr.agent.end_handle_batch = lambda handles: self.assertIs(
+                    captured_handles[-1], handles
+                )
+                wait_event = MagicMock()
+                wait_event.synchronize.side_effect = lambda: actions.append("wait")
+
+                def send_kvcache(*args, **kwargs):
+                    actions.append("send")
+                    if use_torch_transfer:
+                        captured_handles[-1].append("handle")
+                    return "handle"
+
+                mgr.send_kvcache = MagicMock(side_effect=send_kvcache)
+                chunk = self._make_chunk(room, [1], is_last_chunk=False)
+                chunk.wait_event = wait_event
+
+                self._run_worker_once(mgr, chunk)
+
+                self.assertEqual(actions, ["wait", "send"])
+                wait_event.synchronize.assert_called_once_with()
+                self.assertIsNone(chunk.wait_event)
+                if use_torch_transfer:
+                    mgr.agent.progress.assert_called_once_with()
+                else:
+                    mgr.agent.progress.assert_not_called()
+
+    def test_torch_failure_is_published_only_after_every_handle_is_drained(self):
+        room = 26
+        mgr = self._make_manager(room)
+        mgr._use_torch_transfer = True
+        second_req = replace(mgr.transfer_infos[room]["agent"], agent_name="agent-2")
+        mgr.transfer_infos[room]["agent-2"] = second_req
+        mgr.decode_kv_args_table["agent-2"] = mgr.decode_kv_args_table["agent"]
+        release_kv_cache = MagicMock()
+        events = []
+        batch = []
+        original_update_status = mgr.update_status
+
+        def send_kvcache(*args, **kwargs):
+            handle = "failed" if not batch[-1] else "active"
+            batch[-1].append(handle)
+            return handle
+
+        def update_status(candidate_room, status):
+            events.append(("status", status))
+            original_update_status(candidate_room, status)
+            if status == KVPoll.Failed:
+                release_kv_cache(candidate_room)
+
+        def cancel_handles_and_wait(handles):
+            events.append(("drain", tuple(handles)))
+            self.assertEqual(mgr.request_status[room], KVPoll.Transferring)
+            release_kv_cache.assert_not_called()
+
+        mgr.update_status = update_status
+        mgr.send_kvcache = MagicMock(side_effect=send_kvcache)
+        mgr.agent = SimpleNamespace(
+            begin_handle_batch=lambda handles: batch.append(handles),
+            end_handle_batch=lambda handles: self.assertIs(batch[-1], handles),
+            progress=MagicMock(),
+            check_xfer_state=MagicMock(return_value="ERR"),
+            pop_xfer_error=MagicMock(return_value=None),
+            cancel_handles_and_wait=cancel_handles_and_wait,
+        )
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(events[-2], ("drain", ("failed", "active")))
+        self.assertEqual(events[-1], ("status", KVPoll.Failed))
+        release_kv_cache.assert_called_once_with(room)
+        self.assertEqual(mgr._staging_outstanding[room], 0)
+        self.assertFalse(chunk.staging_counted)
+
+    def test_fatal_worker_cut_waits_without_timeout_until_batch_is_quiescent(self):
+        class FatalWorkerCut(BaseException):
+            pass
+
+        room = 28
+        mgr = self._make_manager(room)
+        mgr._use_torch_transfer = True
+        mgr.enable_deferred_decode_kv_release = True
+        events = []
+        batches = []
+        cleanup_attempts = 0
+        original_update_status = mgr.update_status
+
+        def begin(handles):
+            batches.append(handles)
+            events.append("begin")
+
+        def send_then_die(*args, **kwargs):
+            batches[-1].append("live-handle")
+            raise FatalWorkerCut("worker cancelled")
+
+        def retain(handles):
+            self.assertIs(handles, batches[-1])
+            self.assertEqual(mgr.request_status[room], KVPoll.Transferring)
+            events.append("retain")
+
+        def drain(handles):
+            nonlocal cleanup_attempts
+            cleanup_attempts += 1
+            events.append(f"drain-{cleanup_attempts}")
+            self.assertIs(handles, batches[-1])
+            self.assertEqual(mgr.request_status[room], KVPoll.Transferring)
+            if cleanup_attempts == 1:
+                raise KeyboardInterrupt("cleanup interrupted")
+
+        def update_status(candidate_room, status):
+            original_update_status(candidate_room, status)
+            if status == KVPoll.Failed:
+                events.append("failed")
+
+        def ack(candidate_room, generation=None):
+            self.assertEqual(candidate_room, room)
+            self.assertEqual(generation, TRANSFER_GENERATION)
+            self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+            self.assertEqual(mgr._staging_outstanding[room], 0)
+            self.assertFalse(chunk.staging_counted)
+            events.append("ack")
+
+        def end(handles):
+            self.assertIs(handles, batches[-1])
+            events.append("end")
+
+        mgr.update_status = update_status
+        mgr.send_kvcache = MagicMock(side_effect=send_then_die)
+        mgr._maybe_ack_drained_abort = ack
+        mgr.agent = SimpleNamespace(
+            begin_handle_batch=begin,
+            end_handle_batch=end,
+            retain_handle_batch=retain,
+            cancel_handles_and_wait=drain,
+            handle_batch_is_quiescent=lambda handles: False,
+        )
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        queue = SimpleNamespace(get=MagicMock(return_value=chunk))
+
+        with self.assertRaisesRegex(FatalWorkerCut, "worker cancelled"):
+            mgr.transfer_worker(queue)
+
+        self.assertEqual(
+            events,
+            ["begin", "retain", "drain-1", "drain-2", "failed", "ack", "end"],
+        )
+        self.assertEqual(mgr._staging_outstanding[room], 0)
+        self.assertFalse(chunk.staging_counted)
+        self.assertIsInstance(mgr.exceptions[room], RuntimeError)
+
+    def test_torch_peer_bootstrap_base_exception_rolls_back_exact_state(self):
+        class BootstrapCut(BaseException):
+            pass
+
+        class StoreThenInterrupt(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                raise BootstrapCut("manager commit cut")
+
+        room = 29
+        mgr = self._make_manager(room)
+        mgr._use_torch_transfer = True
+        mgr.attn_tp_size = 1
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.requires_dcp_relayout = MagicMock(return_value=False)
+        mgr.prep_handles = {"": "existing-local"}
+        mgr.decode_kv_args_table = StoreThenInterrupt()
+        released = []
+        rolled_back = []
+        mgr.agent = SimpleNamespace(
+            add_remote_agent=MagicMock(return_value="agent"),
+            release_dlist_handle=lambda handle: released.append(handle),
+            rollback_remote_agent=lambda name, metadata: rolled_back.append(
+                (name, metadata)
+            ),
+        )
+        mgr._prepare_payload_xfer = lambda peer: mgr.prep_handles.__setitem__(
+            "agent", "new-remote"
+        )
+        peer = SimpleNamespace(
+            agent_name="agent",
+            agent_metadata=b"peer-metadata",
+            decode_tp_size=1,
+            dst_dcp_size=1,
+            dst_dcp_rank=0,
+            dst_kv_mem_kinds=["VRAM"],
+        )
+
+        with self.assertRaisesRegex(BootstrapCut, "manager commit cut"):
+            mgr._add_remote_peer(peer)
+
+        self.assertNotIn("agent", mgr.decode_kv_args_table)
+        self.assertEqual(mgr.prep_handles, {"": "existing-local"})
+        self.assertEqual(released, ["new-remote"])
+        self.assertEqual(rolled_back, [("agent", b"peer-metadata")])
+
+    def test_partial_multi_submit_uses_worker_owned_handle_sink(self):
+        room = 27
+        mgr = self._make_manager(room)
+        mgr._use_torch_transfer = True
+        mgr.decode_kv_args_table["agent"].kv_xfer_segments = [object(), object()]
+        drained = []
+
+        def submit_then_fail(_peer, _src, _dst, _notif, handles):
+            handles.append("first-active-part")
+            raise RuntimeError("second part failed before publication")
+
+        mgr.send_kvcache_mixed = MagicMock(side_effect=submit_then_fail)
+        mgr.agent = SimpleNamespace(
+            begin_handle_batch=lambda handles: None,
+            end_handle_batch=lambda handles: None,
+            progress=MagicMock(),
+            check_xfer_state=MagicMock(),
+            pop_xfer_error=MagicMock(return_value=None),
+            cancel_handles_and_wait=lambda handles: drained.append(tuple(handles)),
+        )
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(drained, [("first-active-part",)])
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+
     def test_dcp_destinations_use_disjoint_pack_regions_before_chunk_barrier(self):
-        room = 23
+        room = 25
         mgr = self._make_manager(room)
         agents = ("agent0a", "agent0b", "agent1")
         dcp_ranks = (0, 0, 1)
@@ -550,6 +1005,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 dst_aux_index=0,
                 required_dst_info_num=len(agents),
                 dst_state_indices=[],
+                transfer_generation=TRANSFER_GENERATION,
             )
             for i, agent in enumerate(agents)
         }
@@ -623,10 +1079,23 @@ class TestNixlTransferWorker(CustomTestCase):
 
 
 class TestNixlNotifications(CustomTestCase):
-    def _make_manager(self, messages, required=None):
+    def _make_manager(
+        self,
+        messages,
+        *,
+        room=5,
+        required=None,
+        generation=TRANSFER_GENERATION,
+        expected_ranks=frozenset({0}),
+    ):
         mgr = object.__new__(NixlKVManager)
         mgr.agent = NotificationFakeAgent(messages)
-        mgr.transfer_statuses = defaultdict(TransferStatus)
+        mgr.transfer_statuses = {
+            room: TransferStatus(
+                transfer_generation=generation,
+                expected_source_ranks=expected_ranks,
+            )
+        }
         mgr.required_prefill_response_num_table = required or {}
         mgr.enable_staging = False
         mgr._staging_handler = None
@@ -634,7 +1103,7 @@ class TestNixlNotifications(CustomTestCase):
         return mgr
 
     def test_kv_last_notification_sets_expected_count(self):
-        mgr = self._make_manager(["5_kv_2_1_0"])
+        mgr = self._make_manager([completion_notification(5, "kv_2_1_0")])
 
         mgr.update_transfer_status()
 
@@ -644,19 +1113,26 @@ class TestNixlNotifications(CustomTestCase):
         self.assertEqual(status.num_pp_ranks_expected, 1)
 
     def test_staging_notification_preserves_agent_name_with_underscores(self):
-        mgr = self._make_manager(["5_stg_0_1_0_2_4_8_agent_with_underscores"])
+        mgr = self._make_manager(
+            [completion_notification(5, "stg_0_1_0_2_4_8_agent_with_underscores")]
+        )
         calls = []
         mgr._handle_staging_chunk_arrived = lambda *args: calls.append(args)
 
         mgr.update_transfer_status()
 
-        self.assertEqual(calls, [(5, 2, 4, 8, "agent_with_underscores")])
+        self.assertEqual(calls, [(5, 2, 4, 8, 0)])
         status = mgr.transfer_statuses[5]
         self.assertEqual(status.received_kvs_per_pp[0], {0})
         self.assertEqual(status.expected_kvs_per_pp[0], 1)
 
     def test_aux_nokv_marks_zero_expected_chunks_for_pp_rank(self):
-        mgr = self._make_manager(["6_aux_nokv_3"], required={6: 4})
+        mgr = self._make_manager(
+            [completion_notification(6, "aux_nokv_3_0")],
+            room=6,
+            required={6: 4},
+            expected_ranks=frozenset({0, 1, 2, 3}),
+        )
 
         mgr.update_transfer_status()
 
@@ -666,21 +1142,268 @@ class TestNixlNotifications(CustomTestCase):
         self.assertEqual(status.num_pp_ranks_expected, 4)
 
     def test_state_notification_marks_pp_rank(self):
-        mgr = self._make_manager(["7_state_2"])
+        mgr = self._make_manager(
+            [completion_notification(7, "state_2_4")],
+            room=7,
+            expected_ranks=frozenset({2}),
+        )
 
         mgr.update_transfer_status()
 
         self.assertEqual(mgr.transfer_statuses[7].received_state_per_pp, {2})
 
     def test_aux_nokv_allows_full_hit_completion(self):
-        mgr = self._make_manager(["8_aux_nokv_0"], required={8: 1})
+        mgr = self._make_manager(
+            [completion_notification(8, "aux_nokv_0_0")],
+            room=8,
+            required={8: 1},
+        )
 
         mgr.update_transfer_status()
 
         self.assertTrue(mgr.transfer_statuses[8].is_done())
 
+    def test_mixed_parts_complete_only_after_all_generation_bound_parts(self):
+        mgr = self._make_manager(
+            [
+                completion_notification(9, "kv_0_1_0_part_0_2"),
+                completion_notification(9, "kv_0_1_0_part_1_2"),
+            ],
+            room=9,
+        )
+
+        mgr.update_transfer_status()
+
+        status = mgr.transfer_statuses[9]
+        self.assertEqual(status.received_kvs_per_pp[0], {0})
+        self.assertEqual(status.expected_kvs_per_pp[0], 1)
+
+    def test_arbitrary_and_duplicate_source_ranks_cannot_satisfy_completion(self):
+        mgr = self._make_manager(
+            [
+                completion_notification(10, "kv_0_1_99"),
+                completion_notification(10, "aux_99"),
+                completion_notification(10, "kv_0_1_0"),
+                completion_notification(10, "kv_0_1_0"),
+                completion_notification(10, "aux_0"),
+            ],
+            room=10,
+            expected_ranks=frozenset({0, 1}),
+        )
+
+        mgr.update_transfer_status()
+
+        status = mgr.transfer_statuses[10]
+        self.assertEqual(status.received_kvs_per_pp, {0: {0}})
+        self.assertEqual(status.expected_kvs_per_pp, {0: 1})
+        self.assertTrue(status.received_aux)
+        self.assertFalse(status.is_done())
+
+    def test_old_generation_cannot_mutate_any_completion_family_after_reuse(self):
+        mgr = self._make_manager(
+            [
+                completion_notification(5, "kv_0_1_0", OLD_TRANSFER_GENERATION),
+                completion_notification(
+                    5, "kv_0_1_0_part_0_1", OLD_TRANSFER_GENERATION
+                ),
+                completion_notification(5, "state_0_0", OLD_TRANSFER_GENERATION),
+                completion_notification(5, "aux_nokv_0_0", OLD_TRANSFER_GENERATION),
+                completion_notification(
+                    5,
+                    "stg_0_1_0_0_0_1_old_agent",
+                    OLD_TRANSFER_GENERATION,
+                ),
+            ]
+        )
+        staging_calls = []
+        mgr._handle_staging_chunk_arrived = lambda *args: staging_calls.append(args)
+
+        mgr.update_transfer_status()
+
+        status = mgr.transfer_statuses[5]
+        self.assertEqual(status.received_kvs_per_pp, {})
+        self.assertEqual(status.expected_kvs_per_pp, {})
+        self.assertEqual(status.received_state_per_pp, set())
+        self.assertFalse(status.received_aux)
+        self.assertIsNone(status.received_kv_parts_per_pp)
+        self.assertEqual(staging_calls, [])
+
+    def test_legacy_and_malformed_notifications_never_create_or_mutate_status(self):
+        mgr = self._make_manager(
+            [
+                "5_kv_0_1_0",
+                f"nixlv1_{TRANSFER_GENERATION}_5_aux",
+                completion_notification(5, "kv_-1_1_0"),
+                completion_notification(5, "kv_0_2_0"),
+                completion_notification(5, "aux_extra"),
+                completion_notification(999, "aux_0"),
+            ]
+        )
+
+        mgr.update_transfer_status()
+
+        self.assertEqual(set(mgr.transfer_statuses), {5})
+        status = mgr.transfer_statuses[5]
+        self.assertEqual(status.received_kvs_per_pp, {})
+        self.assertEqual(status.expected_kvs_per_pp, {})
+        self.assertFalse(status.received_aux)
+
+
+class TestGenerationBoundStagingControl(CustomTestCase):
+    @staticmethod
+    def _request(generation, *, legacy=False):
+        if legacy:
+            return [b"STAGING_REQ", b"7", b"0", b"1", b"peer", b"3"]
+        return [
+            STAGING_REQ_WIRE_TAG,
+            generation.encode("ascii"),
+            b"7",
+            b"0",
+            b"1",
+            b"peer",
+            b"3",
+        ]
+
+    def test_stale_and_legacy_staging_requests_cannot_allocate_reused_room(self):
+        sock = MagicMock()
+        receiver = SimpleNamespace(
+            transfer_generation=TRANSFER_GENERATION,
+            chunk_staging_infos=[],
+            _connect_to_bootstrap_server=MagicMock(
+                return_value=(sock, threading.Lock())
+            ),
+        )
+        allocator = SimpleNamespace(
+            assign=MagicMock(return_value=(3, 128, 0)), total_size=1 << 20
+        )
+        kwargs = dict(
+            staging_allocator=allocator,
+            kv_args=SimpleNamespace(
+                page_size=64,
+                kv_item_lens=[4096, 4096],
+                total_kv_head_num=4,
+                engine_rank=0,
+            ),
+            attn_tp_size=16,
+            prefill_attn_tp_size=1,
+            kv_buffer_tensors=None,
+            room_receivers={7: receiver},
+            room_bootstrap={7: [{"pp_rank": 3}]},
+        )
+
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.common.staging_buffer": _fake_staging_buffer_module()
+            },
+        ):
+            self.assertFalse(
+                handle_staging_req(self._request(OLD_TRANSFER_GENERATION), **kwargs)
+            )
+            self.assertFalse(
+                handle_staging_req(
+                    self._request(TRANSFER_GENERATION, legacy=True), **kwargs
+                )
+            )
+
+        allocator.assign.assert_not_called()
+        receiver._connect_to_bootstrap_server.assert_not_called()
+        self.assertEqual(receiver.chunk_staging_infos, [])
+
+    def test_staging_request_and_response_bind_exact_generation(self):
+        sock = MagicMock()
+        receiver = SimpleNamespace(
+            transfer_generation=TRANSFER_GENERATION,
+            chunk_staging_infos=[],
+            _connect_to_bootstrap_server=MagicMock(
+                return_value=(sock, threading.Lock())
+            ),
+        )
+        allocator = SimpleNamespace(
+            assign=MagicMock(return_value=(3, 128, 0)), total_size=1 << 20
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.common.staging_buffer": _fake_staging_buffer_module()
+            },
+        ):
+            self.assertTrue(
+                handle_staging_req(
+                    self._request(TRANSFER_GENERATION),
+                    allocator,
+                    SimpleNamespace(
+                        page_size=64,
+                        kv_item_lens=[4096, 4096],
+                        total_kv_head_num=4,
+                        engine_rank=0,
+                    ),
+                    attn_tp_size=16,
+                    prefill_attn_tp_size=1,
+                    kv_buffer_tensors=None,
+                    room_receivers={7: receiver},
+                    room_bootstrap={7: [{"pp_rank": 3}]},
+                )
+            )
+
+        expected_rsp = [
+            STAGING_RSP_WIRE_TAG,
+            TRANSFER_GENERATION.encode("ascii"),
+            b"7",
+            b"0",
+            b"128",
+            b"0",
+            b"640",
+            b"peer",
+        ]
+        sock.send_multipart.assert_called_once_with(expected_rsp)
+
+        tinfo = SimpleNamespace(
+            transfer_generation=TRANSFER_GENERATION,
+            staging=None,
+        )
+        transfer_infos = {7: {"peer": tinfo}}
+        stale_rsp = list(expected_rsp)
+        stale_rsp[1] = OLD_TRANSFER_GENERATION.encode("ascii")
+        self.assertFalse(handle_staging_rsp(stale_rsp, transfer_infos))
+        self.assertIsNone(tinfo.staging)
+        self.assertFalse(
+            handle_staging_rsp(
+                [b"STAGING_RSP", b"7", b"0", b"128", b"0", b"640", b"peer"],
+                transfer_infos,
+            )
+        )
+        self.assertIsNone(tinfo.staging)
+
+        self.assertTrue(handle_staging_rsp(expected_rsp, transfer_infos))
+        self.assertEqual(tinfo.staging.offsets, [128])
+        self.assertEqual(tinfo.staging.rounds, [0])
+        self.assertEqual(tinfo.staging.ends, [640])
+
 
 class TestNixlReceiverPoll(CustomTestCase):
+    def test_supplied_generation_is_shared_and_read_only_across_decode_ranks(self):
+        mgr = SimpleNamespace(
+            transfer_statuses={},
+            addr_to_rooms_tracker=defaultdict(set),
+            update_status=MagicMock(),
+        )
+
+        first = NixlKVReceiver(
+            mgr, "prefill:8998", 11, transfer_generation=TRANSFER_GENERATION
+        )
+        second = NixlKVReceiver(
+            mgr, "prefill:8998", 11, transfer_generation=TRANSFER_GENERATION
+        )
+
+        self.assertEqual(first.transfer_generation, TRANSFER_GENERATION)
+        self.assertEqual(second.transfer_generation, TRANSFER_GENERATION)
+        self.assertEqual(
+            mgr.transfer_statuses[11].transfer_generation, TRANSFER_GENERATION
+        )
+        with self.assertRaises(AttributeError):
+            first.transfer_generation = OLD_TRANSFER_GENERATION
+
     def _make_receiver(self, status=KVPoll.WaitingForInput):
         mgr = MagicMock()
         mgr.waiting_timeout = 5
@@ -698,6 +1421,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.init_time = None
         receiver.conclude_state = None
         receiver.abort_notified = False
+        receiver._transfer_generation = TRANSFER_GENERATION
         receiver._connection_pool_entries = {}
         return receiver, mgr
 
@@ -742,7 +1466,9 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
         receiver.started_transfer = True
         receiver.init_time = 10.0
-        mgr.transfer_statuses = {11: TransferStatus()}
+        mgr.transfer_statuses = {
+            11: TransferStatus(transfer_generation=TRANSFER_GENERATION)
+        }
         mgr.check_transfer_done.return_value = True
 
         self.assertEqual(receiver.poll(), KVPoll.Success)
@@ -757,7 +1483,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
         receiver.started_transfer = True
         receiver.init_time = 10.0
-        status = TransferStatus()
+        status = TransferStatus(transfer_generation=TRANSFER_GENERATION)
         status.received_aux = True
         status.num_pp_ranks_expected = 1
         status.expected_kvs_per_pp[0] = 0
@@ -912,6 +1638,7 @@ class TestNixlStaging(CustomTestCase):
                     dst_aux_index=0,
                     required_dst_info_num=1,
                     dst_state_indices=[],
+                    transfer_generation=TRANSFER_GENERATION,
                 )
             }
         }
@@ -937,7 +1664,11 @@ class TestNixlStaging(CustomTestCase):
             prefill_aux_index=None,
             state_indices=None,
         )
-        req = SimpleNamespace(room=3, agent_name="decode_agent")
+        req = SimpleNamespace(
+            room=3,
+            agent_name="decode_agent",
+            completion_notification_prefix=f"nixlv2_{TRANSFER_GENERATION}_3",
+        )
         queue = FakeQueue()
 
         with patch.dict(
@@ -994,7 +1725,13 @@ class TestNixlStaging(CustomTestCase):
                     strategy,
                     kv_chunk,
                     kv_chunk.prefill_kv_indices,
-                    SimpleNamespace(room=3, agent_name="decode_agent"),
+                    SimpleNamespace(
+                        room=3,
+                        agent_name="decode_agent",
+                        completion_notification_prefix=(
+                            f"nixlv2_{TRANSFER_GENERATION}_3"
+                        ),
+                    ),
                     SimpleNamespace(),
                     FakeQueue(),
                 )
@@ -1040,14 +1777,21 @@ class TestNixlStaging(CustomTestCase):
             strategy,
             kv_chunk,
             kv_chunk.prefill_kv_indices,
-            SimpleNamespace(room=3, agent_name="decode_agent"),
+            SimpleNamespace(
+                room=3,
+                agent_name="decode_agent",
+                completion_notification_prefix=f"nixlv2_{TRANSFER_GENERATION}_3",
+            ),
             dst_info,
             FakeQueue(),
         )
 
         self.assertEqual(handle, "handle")
         self.assertFalse(deferred)
-        self.assertEqual(calls[0][0][8], "3_stg_7_1_1_2_4_2_decode_agent")
+        self.assertEqual(
+            calls[0][0][8],
+            completion_notification(3, "stg_7_1_1_2_4_2_decode_agent"),
+        )
 
     def test_send_kvcache_staged_uses_one_bulk_vram_write(self):
         mock_gather = MagicMock()
@@ -1076,7 +1820,7 @@ class TestNixlStaging(CustomTestCase):
                 dst_tp_rank=0,
                 dst_attn_tp_size=1,
                 dst_kv_item_len=128,
-                notif="3_stg_0_1_1_0_0_2_decode_agent",
+                notif=completion_notification(3, "stg_0_1_1_0_0_2_decode_agent"),
                 staging_buffer=FakeStagingBuffer(ptr=0x9000, size=1 << 20),
             )
 
@@ -1095,7 +1839,7 @@ class TestNixlStaging(CustomTestCase):
         self.assertEqual(agent.initialize_xfer_calls[0][0], "WRITE")
         self.assertEqual(
             agent.initialize_xfer_calls[0][-1],
-            b"3_stg_0_1_1_0_0_2_decode_agent",
+            completion_notification(3, "stg_0_1_1_0_0_2_decode_agent").encode("ascii"),
         )
 
     def test_send_kvcache_staged_falls_back_when_prefill_buffer_too_small(self):
@@ -1139,6 +1883,44 @@ class DlistCaptureAgent:
     def prep_xfer_dlist(self, peer_name, array, mem_kind):
         self.calls.append((peer_name, np.asarray(array), mem_kind))
         return f"handle_{len(self.calls)}"
+
+
+class TestNixlTorchTransferCompactDlist(CustomTestCase):
+    def test_equal_tp_dlist_uses_one_strided_region_per_allocation(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr._use_torch_transfer = True
+        mgr.agent = DlistCaptureAgent()
+
+        handle = mgr._prep_equal_tp_dlist(
+            "decode-agent",
+            kv_ptrs=[0x10000, 0x20000],
+            kv_item_lens=[64, 128],
+            kv_data_lens=[640, 1280],
+            gpu_id=3,
+        )
+
+        self.assertEqual(handle, "handle_1")
+        peer_name, descriptors, memory_type = mgr.agent.calls[0]
+        self.assertEqual(peer_name, "decode-agent")
+        self.assertEqual(memory_type, "VRAM")
+        np.testing.assert_array_equal(
+            descriptors,
+            np.asarray(
+                [
+                    [0x10000, 64, 3, 64, 10],
+                    [0x20000, 128, 3, 128, 10],
+                ],
+                dtype=np.uint64,
+            ),
+        )
+        np.testing.assert_array_equal(
+            repeat_indices_over_layers(
+                np.asarray([1, 9], dtype=np.int32),
+                num_layers=2,
+                layer_length=10,
+            ),
+            np.asarray([1, 9, 11, 19], dtype=np.int32),
+        )
 
 
 class TestNixlHeteroTpReplicatedKV(CustomTestCase):

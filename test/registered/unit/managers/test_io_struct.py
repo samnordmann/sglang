@@ -43,6 +43,34 @@ register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 
 class TestTokenizedReqInputMsgpack(unittest.TestCase):
+    def test_transfer_generation_is_append_only_and_round_trips(self):
+        generation = "11" * 16
+        self.assertEqual(
+            TokenizedGenerateReqInput.__struct_fields__[-1], "transfer_generation"
+        )
+        request = TokenizedGenerateReqInput(
+            input_text="",
+            input_ids=array("q", [1, 2]),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            return_logprob=False,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            routing_key="existing-wire-field",
+            cache_salt="existing-tail-field",
+            transfer_generation=generation,
+        )
+
+        decoded = msgpack_decode(msgpack_encode(request))
+
+        self.assertEqual(decoded.routing_key, "existing-wire-field")
+        self.assertEqual(decoded.cache_salt, "existing-tail-field")
+        self.assertEqual(decoded.transfer_generation, generation)
+
     def test_rust_tokenized_generate_schema_stays_in_lockstep(self):
         """Compare the Rust wire declaration with the imported Python schema."""
         rust_path = (

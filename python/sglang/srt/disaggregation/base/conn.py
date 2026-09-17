@@ -104,7 +104,10 @@ class KVPoll:
 class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
-    enable_deferred_decode_kv_release: bool = False
+    # Decode destination memory is always quarantined after a transfer abort
+    # until every possible remote writer proves quiescence. Concrete managers
+    # must not make this safety property optional.
+    enable_deferred_decode_kv_release: bool = True
 
     @abstractmethod
     def __init__(

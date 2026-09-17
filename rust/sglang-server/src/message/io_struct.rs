@@ -43,9 +43,9 @@ wire_struct! {
         lora_id: (),
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block — the last fields emitted; everything after
-        /// `disagg_prefill_dp_rank` in Python has a msgspec default and is
-        /// omitted (short arrays decode with defaulted tails).
+        /// PD-disaggregation block. The internal generation is append-only at
+        /// the end of Python's array-like schema, so all intervening defaulted
+        /// fields must remain present here to preserve their wire positions.
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -53,6 +53,21 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
+        routing_key: (),
+        require_reasoning: bool,
+        priority: (),
+        extra_key: (),
+        no_logs: bool,
+        return_bytes: bool,
+        return_entropy: bool,
+        need_wait_for_mm_inputs: (),
+        num_items_assigned: (),
+        encoder_urls: (),
+        multi_item_delimiter_indices: (),
+        time_stats: (),
+        cache_salt: (),
+        /// Internal room-lease identity shared by every scheduler rank.
+        transfer_generation: Option<&'a str>,
     }
 }
 
@@ -114,6 +129,20 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
+            routing_key: (),
+            require_reasoning: false,
+            priority: (),
+            extra_key: (),
+            no_logs: false,
+            return_bytes: false,
+            return_entropy: false,
+            need_wait_for_mm_inputs: (),
+            num_items_assigned: (),
+            encoder_urls: (),
+            multi_item_delimiter_indices: (),
+            time_stats: (),
+            cache_salt: (),
+            transfer_generation: req.transfer_generation.as_deref(),
         }
     }
 }
@@ -180,9 +209,9 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 32 (through
-        // `disagg_prefill_dp_rank`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 32, "header ends at disagg_prefill_dp_rank");
+        // msgspec requires >= 14 (through `stream`); generation is an
+        // append-only field at 45, after every pre-existing optional field.
+        assert_eq!(arr.len(), 46, "header ends at transfer_generation");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -210,6 +239,7 @@ mod tests {
             Some(true),
             "return_hidden_states at idx 16"
         );
+        assert!(arr[45].is_nil(), "generation is nil without a PD room");
     }
 
     /// The PD block must land on Python's wire indices 25–31, with the filler
@@ -227,6 +257,7 @@ mod tests {
             decode_tp_size: Some(2),
             routed_dp_rank: Some(3),
             disagg_prefill_dp_rank: Some(4),
+            transfer_generation: Some("11111111111111111111111111111111".into()),
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
@@ -245,5 +276,16 @@ mod tests {
         assert_eq!(arr[29].as_i64(), Some(2), "decode_tp_size at 29");
         assert_eq!(arr[30].as_i64(), Some(3), "routed_dp_rank at 30");
         assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
+        for i in [32, 34, 35, 39, 40, 41, 42, 43, 44] {
+            assert!(arr[i].is_nil(), "defaulted optional field at idx {i}");
+        }
+        for i in [33, 36, 37, 38] {
+            assert_eq!(arr[i].as_bool(), Some(false), "false default at idx {i}");
+        }
+        assert_eq!(
+            arr[45].as_str(),
+            Some("11111111111111111111111111111111"),
+            "transfer_generation at append-only idx 45"
+        );
     }
 }
