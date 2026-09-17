@@ -450,6 +450,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
         )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
+        if envs.SGLANG_DISAGGREGATION_NIXL_USE_TORCH_TRANSFER.get():
+            from nixl.torch_transfer import TorchTransferAgent
+
+            # The manager's allocation lifetime contract remains unchanged.
+            self.agent = TorchTransferAgent(self.agent, owner=self)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
             # nixl_agent_config to explicitly-created backends.
