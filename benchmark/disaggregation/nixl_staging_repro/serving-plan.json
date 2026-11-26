@@ -1,0 +1,28 @@
+{
+  "lengths": [
+    64,
+    2048
+  ],
+  "depths": [
+    1,
+    4
+  ],
+  "repeats": 24,
+  "warmup": 2,
+  "orders": [
+    [
+      "0-baseline",
+      "0-patched"
+    ],
+    [
+      "1-patched",
+      "1-baseline"
+    ]
+  ],
+  "oracles": [
+    "oracle",
+    "oracle-p1d2",
+    "oracle-p1d2-repeat"
+  ],
+  "prompt_workload": "natural-v1"
+}
