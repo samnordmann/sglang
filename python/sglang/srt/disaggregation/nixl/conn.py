@@ -496,7 +496,7 @@ def expand_page_indices_for_slice(
         + head_group_idx
     ).ravel()
     pair_offsets = np.arange(num_ptr_pairs, dtype=np.int64) * pair_stride
-    return (pair_offsets[:, None] + within_pair[None, :]).ravel().astype(np.int32)
+    return np.add(pair_offsets[:, None], within_pair[None, :], dtype=np.int32).ravel()
 
 
 def num_kv_slots(kv_data_lens: List[int], kv_item_lens: List[int]) -> int:
@@ -525,7 +525,7 @@ def repeat_indices_over_layers(
     (K+V ptrs, 2×N entries).
     """
     offsets = np.arange(num_layers, dtype=np.int32) * layer_length
-    return (offsets[:, None] + indices[None, :]).ravel().astype(np.int32)
+    return (offsets[:, None] + indices[None, :]).ravel().astype(np.int32, copy=False)
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
